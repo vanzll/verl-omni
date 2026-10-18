@@ -23,6 +23,8 @@ def expected(micro):
         "algorithm.art_joint_latent": True, "algorithm.art_cached_conditional_velocity": True,
         "algorithm.art_joint_reward_routing": True, "algorithm.art_prompt_balanced_split": True,
         "algorithm.norm_adv_by_std_in_grpo": False, "algorithm.art_exclude_final_step": True,
+        "algorithm.art_prompt_group_std": True, "algorithm.art_first_update_mask_exempt": True,
+        "actor_rollout_ref.actor.diffusion_loss.art_first_update_mask_exempt": True,
         "algorithm.old_policy_decay_schedule": "copy", "algorithm.old_policy_update_interval": 1,
         "actor_rollout_ref.actor.use_kl_loss": False,
         "actor_rollout_ref.actor.diffusion_loss.art_mask_threshold": 1e-5,
@@ -102,7 +104,7 @@ def validate(config, micro):
             actual = actual[component]
         if actual != wanted:
             raise ValueError(f"{key}: actual={actual!r}, required={wanted!r}")
-    if "A3JOINT32" not in config["trainer"]["experiment_name"]:
+    if "A12JOINT32" not in config["trainer"]["experiment_name"]:
         raise ValueError("wrong experiment identity")
 
 if __name__ == "__main__":

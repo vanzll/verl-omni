@@ -201,7 +201,7 @@ def prepare(args):
                    for base in ("/m2v_intern/zhenglin", "/m2v_intern2/zhenglin")):
             raise RuntimeError("write root must be an authorized isolated extension")
     runtime = choose_runtime(args.runtime_root, args.fallback_runtime_root)
-    run = "LTX23-A3JOINT32-P32K8-UNBOUNDED-S42-" + time.strftime("%Y%m%dT%H%M%S") + "-" + secrets.token_hex(3)
+    run = "LTX23-A12JOINT32-P32K8-UNBOUNDED-S42-" + time.strftime("%Y%m%dT%H%M%S") + "-" + secrets.token_hex(3)
     output = runtime / "attempts" / run
     for directory in ("logs", "nodes", "provenance"):
         (output / directory).mkdir(parents=True, exist_ok=False)
@@ -242,7 +242,7 @@ def prepare(args):
                       OMNI_RAY_PORT=ray_port, OMNI_RAY_OBJECT_STORE_BYTES=OBJECT_STORE,
                       RAY_ADDRESS=f"{next(iter(PORTS))}:{ray_port}",
                       OMNI_NODE_DESCRIPTOR=str(descriptor), OMNI_LAUNCH_MANIFEST_SHA256=launch_sha,
-                      OMNI_VARIANT="A3JOINT32", RUN_NAME=run, OUTPUT_DIR=str(output),
+                      OMNI_VARIANT="A12JOINT32", RUN_NAME=run, OUTPUT_DIR=str(output),
                       WANDB_RUN_ID=run_id, WANDB_RESUME="never", WANDB_MODE="online", WANDB_ENTITY=args.wandb_entity,
                       OMNI_UPDATE_MICROBATCH=args.update_microbatch, OMNI_ART_CACHE_ACCEPTANCE="1")
         for key, directory in {

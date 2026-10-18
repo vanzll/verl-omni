@@ -54,6 +54,9 @@ class DiffusionLossConfig(BaseConfig):
     art_mask_threshold: float = 1e-5
     art_reference_noise_level: float = 0.8
     art_corrective_mask_enabled: bool = True
+
+    # Require first-window exemption metadata from the prompt-balanced ART split.
+    art_first_update_mask_exempt: bool = False
     art_video_weight: float = 1.0
     art_audio_weight: float = 1.0
     # Use one guidance and trust-region mask over the joint latent sequence.

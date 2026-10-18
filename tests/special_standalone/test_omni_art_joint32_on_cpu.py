@@ -236,7 +236,7 @@ class LaunchTests(unittest.TestCase):
                            OMNI_CONTROL_DIR=str(SCRIPTS), OMNI_RUNTIME_ROOT=str(root),
                            SOURCE_CHECKOUT_DIR=str(REPO), SOURCE_SNAPSHOT_SHA256="a" * 64,
                            SOURCE_FILES_MANIFEST_SHA256="b" * 64, OUTPUT_DIR=str(root / "output"),
-                           RUN_NAME="A3JOINT32-cpu", WANDB_RUN_ID="fresh", WANDB_RESUME="never",
+                           RUN_NAME="A12JOINT32-cpu", WANDB_RUN_ID="fresh", WANDB_RESUME="never",
                            RAY_ADDRESS="head:17000", PYTHONPATH=str(REPO), OMNI_UPDATE_MICROBATCH=str(micro))
                 result = subprocess.run(["bash", str(REPO / "examples/diffusionart_trainer/ltx2/run_ltx2_t2av_art_joint32.sh")],
                                         env=env, capture_output=True, text=True, timeout=15)

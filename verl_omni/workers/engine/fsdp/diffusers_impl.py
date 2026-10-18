@@ -1873,7 +1873,7 @@ class ARTDiffusersFSDPEngine(NFTDiffusersFSDPEngine):
         """
         sigma_next = micro_batch["train_timesteps_next"][:, step].float() / float(num_train_timesteps)
         loss_inputs = {"art_guidance": micro_batch["art_guidance"], "sigma_next": sigma_next}
-        for key in ("video_seq_len", "art_anchor"):
+        for key in ("video_seq_len", "art_anchor", "art_update_window", "art_mask_exempt"):
             if micro_batch.get(key, None) is not None:
                 loss_inputs[key] = micro_batch[key]
         if micro_batch.get("train_segment_timesteps", None) is not None:

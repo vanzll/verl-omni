@@ -1708,7 +1708,10 @@ class DiffusionARTLoss(DiffusionLossFn):
     uses_old_adapter = True
     required_model_output_keys = ("forward_prediction", "old_prediction", "t_expanded")
     required_data_keys = ("art_guidance", "sigma_next")
-    optional_data_keys = ("video_seq_len", "art_anchor", "rollout_velocity", "segment_sigma", "segment_sigma_next")
+    optional_data_keys = (
+        "video_seq_len", "art_anchor", "rollout_velocity", "segment_sigma", "segment_sigma_next",
+        "art_mask_exempt", "art_update_window",
+    )
     #: Replicated per-sample tensors carrying whole-rollout scalars that the loss reports as ``actor/<name>``:
     #: OmniNFT's ``reward/<name>/{mean,std,min,max}`` and ``reward/sum/{mean,std}`` (same channel and
     #: semantics) plus ART's per-modality guidance statistics.
@@ -1747,6 +1750,8 @@ class DiffusionARTLoss(DiffusionLossFn):
         rollout_velocity: Optional[torch.Tensor] = None,
         segment_sigma: Optional[torch.Tensor] = None,
         segment_sigma_next: Optional[torch.Tensor] = None,
+        art_mask_exempt: Optional[torch.Tensor] = None,
+        art_update_window: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         """Masked frozen-target MSE averaged over the micro batch (paper Algorithm 1, step 5).
 
@@ -1760,6 +1765,15 @@ class DiffusionARTLoss(DiffusionLossFn):
         supplies them); without them every segment uses ``t_expanded`` / ``sigma_next``.
         """
         loss_cfg = config.diffusion_loss
+        if bool(getattr(loss_cfg, "art_first_update_mask_exempt", False)):
+            if art_mask_exempt is None or art_update_window is None:
+                raise ValueError("A1 requires both art_mask_exempt and art_update_window.")
+            if (
+                art_mask_exempt.dtype != torch.bool
+                or art_mask_exempt.shape != art_update_window.shape
+                or not torch.equal(art_mask_exempt, art_update_window == 0)
+            ):
+                raise ValueError("A1 exemption must equal art_update_window == 0.")
         joint = bool(getattr(loss_cfg, "art_joint_latent", False))
         sigma = t_expanded.reshape(t_expanded.shape[0], -1)[:, 0]
         if joint:
@@ -1811,6 +1825,7 @@ class DiffusionARTLoss(DiffusionLossFn):
                 reference_noise_level=loss_cfg.art_reference_noise_level,
                 corrective_mask_enabled=loss_cfg.art_corrective_mask_enabled,
                 restore_anchor=anchor,
+                mask_exempt=art_mask_exempt,
             )
             per_item_loss = per_item_loss + (segment_weights[name] / total_weight) * terms["per_item_loss"]
             prefix = f"actor/{name}/" if name else "actor/"
@@ -1821,6 +1836,23 @@ class DiffusionARTLoss(DiffusionLossFn):
             if name:
                 metrics[f"{prefix}policy_loss"] = terms["per_item_loss"].detach().mean().item()
             metrics.update(cls._bucket_metrics(prefix, terms, segment_t))
+            if art_update_window is not None:
+                windows = art_update_window.detach().reshape(-1)
+                if windows.shape != sigma.shape or not bool(((windows == 0) | (windows == 1)).all()):
+                    raise ValueError("ART update window must be 0 or 1 for every sample.")
+                if not bool((windows == windows[0]).all()):
+                    raise ValueError("A microbatch must belong to one disjoint update window.")
+                window_prefix = f"{prefix}update{int(windows[0].item()) + 1}/"
+                metrics.update(cls._segment_metrics(
+                    window_prefix, terms, art_guidance[:, rows], old_prediction[:, rows], gap_velocity
+                ))
+                metrics.update(cls._bucket_metrics(window_prefix, terms, segment_t))
+                metrics[f"{window_prefix}would_mask_state_fraction"] = terms["would_mask"].float().mean().item()
+                metrics[f"{window_prefix}masked_state_fraction"] = terms["masked"].float().mean().item()
+                metrics[f"{window_prefix}active_state_fraction"] = terms["active"].float().mean().item()
+                metrics[f"{window_prefix}over_threshold_state_fraction"] = (
+                    terms["active"] & (terms["movement_score"] >= loss_cfg.art_mask_threshold)
+                ).float().mean().item()
         loss = per_item_loss.mean()
         metrics["actor/policy_loss"] = loss.detach().item()
         metrics["actor/total_loss"] = loss.detach().item()
@@ -2008,8 +2040,19 @@ class DiffusionARTLoss(DiffusionLossFn):
             for path in (f"actor.diffusion_loss.{key}", f"rollout.algo.{key}"):
                 if bool(OmegaConf.select(config.actor_rollout_ref, path, default=False)) != expected:
                     problems.append(f"algorithm.{key} must equal actor_rollout_ref.{path}")
+        group_std = bool(algorithm_cfg.get("art_prompt_group_std", False))
+        if group_std and (not joint or not algorithm_cfg.get("art_joint_reward_routing", False)):
+            problems.append("art_prompt_group_std requires art_joint_latent and art_joint_reward_routing")
+        exempt = bool(algorithm_cfg.get("art_first_update_mask_exempt", False))
+        if bool(actor_cfg.diffusion_loss.get("art_first_update_mask_exempt", False)) != exempt:
+            problems.append("algorithm and actor.diffusion_loss must agree on art_first_update_mask_exempt")
         if joint and algorithm_cfg.get("norm_adv_by_std_in_grpo", True):
             problems.append("joint ART requires algorithm.norm_adv_by_std_in_grpo=False (keep raw reward ratios)")
+        if algorithm_cfg.get("art_first_update_mask_exempt", False):
+            if not algorithm_cfg.get("art_prompt_balanced_split", False):
+                problems.append("art_first_update_mask_exempt requires art_prompt_balanced_split")
+            if int(config.data.train_batch_size) != 2 * int(actor_cfg.ppo_mini_batch_size):
+                problems.append("art_first_update_mask_exempt requires exactly two disjoint updates")
         if not int(model_cfg.get("lora_rank", 0) or 0) > 0:
             problems.append("actor_rollout_ref.model.lora_rank must be > 0 (DiffusionART trains LoRA adapters)")
         if "old" not in tuple(model_cfg.get("policy_state_adapters", ("default",))):
@@ -2250,13 +2293,16 @@ class DiffusionARTLoss(DiffusionLossFn):
         (``algorithm.norm_adv_by_std_in_grpo`` / ``global_std``) before the weighted sum, so routing
         weights act on comparable scales; the guidance itself is invariant to per-prompt affine reward
         changes, so only the relative component scales matter. Joint latents require std normalization
-        disabled: raw component ratios and routing weights are preserved, regardless of ``global_std``.
+        disabled by default; ``art_prompt_group_std`` explicitly selects per-component prompt-group scaling.
         """
         rewards = reward_tensor.detach().float().cpu()
         joint = bool(config.algorithm.get("art_joint_latent", False))
+        group_std = bool(config.algorithm.get("art_prompt_group_std", False))
         if joint and config.algorithm.norm_adv_by_std_in_grpo:
             raise ValueError("joint ART requires algorithm.norm_adv_by_std_in_grpo=False (keep raw reward ratios)")
         if modalities == [""]:
+            if group_std:
+                raise ValueError("art_prompt_group_std requires named component rewards and video/audio metadata.")
             if config.algorithm.get("art_joint_reward_routing", False):
                 raise ValueError("ART joint reward routing requires video and audio modalities.")
             return {"": rewards}, None
@@ -2276,6 +2322,8 @@ class DiffusionARTLoss(DiffusionLossFn):
                         if value > 0:
                             routing.setdefault(modality, {})[name] = value
         if not routing:
+            if group_std:
+                raise ValueError("art_prompt_group_std requires named component reward routes.")
             if algorithm_cfg.get("art_joint_reward_routing", False):
                 raise ValueError("ART joint reward routing requires named component routes.")
             return {modality: rewards for modality in modalities}, None
@@ -2286,8 +2334,9 @@ class DiffusionARTLoss(DiffusionLossFn):
                 DiffusionNFTLoss._compute_group_advantages(
                     rewards=cls._component_scores(batch, name),
                     uid=uid,
-                    norm_by_std=algorithm_cfg.norm_adv_by_std_in_grpo,
-                    global_std=algorithm_cfg.global_std,
+                    norm_by_std=bool(algorithm_cfg.get("art_prompt_group_std", False))
+                    or algorithm_cfg.norm_adv_by_std_in_grpo,
+                    global_std=False if algorithm_cfg.get("art_prompt_group_std", False) else algorithm_cfg.global_std,
                 )
                 for name in names
             ],
@@ -2504,6 +2553,9 @@ class DiffusionARTLoss(DiffusionLossFn):
             update_window[torch.from_numpy(rank_rows[:, :half_rank].reshape(-1))] = 0.0
             update_window[torch.from_numpy(rank_rows[:, half_rank:].reshape(-1))] = 1.0
             records["update_window"] = update_window
+            if algorithm_cfg.get("art_first_update_mask_exempt", False):
+                batch.batch["art_update_window"] = update_window.long()
+                batch.batch["art_mask_exempt"] = update_window == 0
         for name, rows in segments:
             rewards = modality_rewards[name]
             label = name or "reward"

@@ -274,6 +274,7 @@ def art_loss(
     reference_noise_level: float = 0.8,
     corrective_mask_enabled: bool = True,
     restore_anchor: torch.Tensor | None = None,
+    mask_exempt: torch.Tensor | None = None,
 ) -> dict[str, torch.Tensor]:
     """Trust-region-masked frozen-target velocity MSE (paper Eq. 6-8, Algorithm 1).
 
@@ -301,6 +302,7 @@ def art_loss(
         reference_noise_level: ``nu`` of the reference SDE used by ``"sde_kl"``.
         corrective_mask_enabled: Disable to ablate the trust-region mask.
         restore_anchor: Optional ``(B,)`` bool; inactive rows flagged here train toward ``v_old``.
+        mask_exempt: Optional ``(B,)`` bool; preserve the target and bypass masking for these rows.
 
     Returns:
         Dict with ``per_item_loss`` ``(B,)`` (differentiable), ``per_item_mse``, ``target``,
@@ -339,9 +341,14 @@ def art_loss(
             movement_score = art_reference_drift(movement_energy, sigma, sigma_next, reference_noise_level)
         else:
             movement_score = movement_energy
-        masked = active & (movement_score >= float(mask_threshold)) & (outward_alignment > 0)
+        would_mask = active & (movement_score >= float(mask_threshold)) & (outward_alignment > 0)
+        masked = would_mask.clone()
         if not corrective_mask_enabled:
             masked = torch.zeros_like(masked)
+        if mask_exempt is not None:
+            if mask_exempt.shape != active.shape or mask_exempt.dtype != torch.bool:
+                raise ValueError("mask_exempt must be a bool tensor with one value per item.")
+            masked &= ~mask_exempt.to(device=active.device)
         keep = anchor | (active & ~masked)
 
     per_item_loss = torch.where(keep, weight * per_item_mse, torch.zeros_like(per_item_mse))
@@ -353,6 +360,7 @@ def art_loss(
         "anchor": anchor,
         "keep_mask": keep,
         "masked": masked,
+        "would_mask": would_mask,
         "movement_energy": movement_energy,
         "movement_score": movement_score,
         "outward_alignment": outward_alignment,

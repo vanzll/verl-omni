@@ -48,6 +48,12 @@ class DiffusionAlgoConfig(BaseConfig):
     art_joint_reward_routing: bool = False
     # One covariance, RMS, trust-region mask and MSE over all endpoint coordinates.
     art_joint_latent: bool = False
+
+    # Standardize each reward component within its full prompt group before joint aggregation.
+    art_prompt_group_std: bool = False
+
+    # Exempt the first disjoint update of every rollout from corrective masking.
+    art_first_update_mask_exempt: bool = False
     # Replay the rollout's pre-CFG conditional velocity as the frozen ART target.
     art_cached_conditional_velocity: bool = False
     art_exclude_final_step: bool = True

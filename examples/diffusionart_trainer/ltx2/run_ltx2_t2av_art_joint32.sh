@@ -22,7 +22,7 @@ output=${OUTPUT_DIR:?OUTPUT_DIR is required}
 run_name=${RUN_NAME:?RUN_NAME is required}
 source_sha=${SOURCE_SNAPSHOT_SHA256:?SOURCE_SNAPSHOT_SHA256 is required}
 ray_address=${RAY_ADDRESS:?}
-[[ "$run_name" == *A3JOINT32* ]] || exit 2
+[[ "$run_name" == *A12JOINT32* ]] || exit 2
 [[ "${WANDB_RESUME:-never}" == never ]] || exit 2
 export WANDB_RESUME=never
 : "${WANDB_RUN_ID:?fresh run ID required}"
@@ -78,6 +78,9 @@ exec bash "$repo/examples/diffusionart_trainer/ltx2/run_ltx2_t2av_art_lora.sh" \
   algorithm.art_joint_latent=true \
   algorithm.art_cached_conditional_velocity=true \
   algorithm.norm_adv_by_std_in_grpo=false \
+  ++algorithm.art_prompt_group_std=true \
+  ++algorithm.art_first_update_mask_exempt=true \
+  ++actor_rollout_ref.actor.diffusion_loss.art_first_update_mask_exempt=true \
   ++actor_rollout_ref.actor.diffusion_loss.art_joint_latent=true \
   ++actor_rollout_ref.actor.diffusion_loss.art_cached_conditional_velocity=true \
   ++actor_rollout_ref.rollout.algo.art_cached_conditional_velocity=true \
