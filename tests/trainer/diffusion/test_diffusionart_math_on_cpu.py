@@ -21,6 +21,7 @@ pin each piece to the paper's equations (arXiv:2610.12572, Eq. 5-8 and App. C.2-
 
 import math
 
+import numpy as np
 import pytest
 import torch
 
@@ -28,10 +29,26 @@ from verl_omni.trainer.diffusion.diffusion_art import (
     art_guidance,
     art_loss,
     art_pairwise_labels,
+    art_prompt_balanced_indices,
     art_reference_drift,
 )
 
 C, H, W = 2, 3, 3
+
+
+def test_prompt_balanced_indices_cover_every_prompt_without_reuse():
+    uid = np.repeat(np.arange(32), 8)
+    order = art_prompt_balanced_indices(uid, group_size=8, seed=43, dp_size=16)
+    assert sorted(order.tolist()) == list(range(256))
+    # Pinned verl dispatch chunks contiguously by rank; each rank takes its
+    # first/second eight rows for the two global optimizer updates.
+    rank_rows = order.reshape(16, 16)
+    for window in (rank_rows[:, :8].reshape(-1), rank_rows[:, 8:].reshape(-1)):
+        np.testing.assert_array_equal(np.bincount(uid[window], minlength=32), np.full(32, 4))
+    np.testing.assert_array_equal(order, art_prompt_balanced_indices(uid, 8, 43, dp_size=16))
+    assert not np.array_equal(order, art_prompt_balanced_indices(uid, 8, 44, dp_size=16))
+    with pytest.raises(ValueError, match="needs 8 samples"):
+        art_prompt_balanced_indices(uid[:-1], 8, 43, dp_size=16)
 
 
 def unit_rms(x: torch.Tensor) -> torch.Tensor:

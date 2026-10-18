@@ -42,6 +42,10 @@ class DiffusionAlgoConfig(BaseConfig):
     train_timestep_count: Optional[int] = None
     adv_mode: str = "continuous"
     art_pairwise_reward: bool = False
+    # After full-group ART guidance, give both optimizer windows half of every prompt's samples.
+    art_prompt_balanced_split: bool = False
+    # Use one weighted component reward for both video and audio covariance directions.
+    art_joint_reward_routing: bool = False
     art_exclude_final_step: bool = True
     art_log_rollout_velocity_gap: bool = False
     art_modality_reward_weights: Optional[dict] = None

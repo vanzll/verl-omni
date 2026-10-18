@@ -19,6 +19,7 @@ from typing import Any, Optional
 
 import numpy as np
 import torch
+from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.import_utils import import_external_libs
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.lora.request import LoRARequest
@@ -226,6 +227,17 @@ class DiffusionStrategy(OmniStrategyBase):
 
     rollout_config_cls = DiffusionRolloutConfig
     model_config_cls = DiffusionModelConfig
+
+    def init_model_config(self, model_config: Any) -> DiffusionModelConfig:
+        # Hydra targets may declare a pipeline subclass (e.g. LTX per-modality
+        # CFG). Merging first into DiffusionModelConfig's base pipeline schema
+        # rejects those valid fields before the nested target can instantiate.
+        if isinstance(model_config, Mapping) and model_config.get("_target_"):
+            converted = omega_conf_to_dataclass(model_config)
+            if not isinstance(converted, self.model_config_cls):
+                raise TypeError(f"Expected {self.model_config_cls.__name__}, got {type(converted).__name__}")
+            return converted
+        return super().init_model_config(model_config)
 
     def worker_extension_cls(self, device_type: str) -> str:
         if device_type == "npu":

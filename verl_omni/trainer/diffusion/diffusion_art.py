@@ -34,6 +34,7 @@ __all__ = [
     "art_guidance",
     "art_loss",
     "art_pairwise_labels",
+    "art_prompt_balanced_indices",
     "art_reference_drift",
     "group_index_from_uid",
 ]
@@ -53,6 +54,44 @@ def group_index_from_uid(uid: np.ndarray) -> tuple[torch.Tensor, int]:
     rank[np.argsort(first, kind="stable")] = np.arange(first.size)
     group_index = torch.from_numpy(rank[inverse.reshape(-1)].astype(np.int64))
     return group_index, int(first.size)
+
+
+def art_prompt_balanced_indices(uid: np.ndarray, group_size: int, seed: int, dp_size: int = 1) -> np.ndarray:
+    """Order complete rollout groups into two disjoint, prompt-complete update windows.
+
+    Each window receives half of every prompt's samples. Rows are emitted in
+    contiguous DP-rank chunks because each rank iterates its local first/second
+    half for the two global updates. The permutation is made after guidance has
+    been estimated from the full group.
+    """
+    groups, num_groups = group_index_from_uid(uid)
+    groups = groups.numpy()
+    if group_size < 2 or group_size % 2:
+        raise ValueError(f"ART prompt-balanced split needs an even group size >= 2, got {group_size}.")
+    if len(groups) != num_groups * group_size:
+        raise ValueError(
+            f"ART prompt-balanced split needs {group_size} samples for each of {num_groups} prompts, "
+            f"got {len(groups)} rows."
+        )
+    rng = np.random.default_rng(seed)
+    windows: tuple[list[np.ndarray], list[np.ndarray]] = ([], [])
+    half = group_size // 2
+    for group in range(num_groups):
+        rows = np.flatnonzero(groups == group)
+        if len(rows) != group_size:
+            raise ValueError(f"ART prompt {group} has {len(rows)} samples, expected {group_size}.")
+        shuffled = rng.permutation(rows)
+        windows[0].append(shuffled[:half])
+        windows[1].append(shuffled[half:])
+    if dp_size < 1 or len(groups) % (2 * dp_size):
+        raise ValueError(f"ART update batch of {len(groups)} rows must split evenly into two updates on {dp_size} DP ranks.")
+    per_rank_window = len(groups) // (2 * dp_size)
+    # Dispatch chunks the global batch contiguously by DP rank. Each rank's
+    # local iterator then takes its first half for update 0 and second half for
+    # update 1. Lay out the two prompt-balanced windows in that rank-major order.
+    first = np.concatenate(windows[0]).reshape(dp_size, per_rank_window)
+    second = np.concatenate(windows[1]).reshape(dp_size, per_rank_window)
+    return np.concatenate((first, second), axis=1).reshape(-1).astype(np.int64, copy=False)
 
 
 @torch.no_grad()

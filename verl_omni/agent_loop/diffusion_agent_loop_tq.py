@@ -72,6 +72,12 @@ class DiffusionAgentLoopWorkerTQ(DiffusionAgentLoopWorker):
             sampling_params.update(_config_to_sampling_dict(config.val_kwargs.algo))
             sampling_params["seed"] = config.val_kwargs.seed
             sampling_params["logprobs"] = False
+            validation_seed_meta = batch.get("rollout_seed")
+            rollout_base_seed = int(
+                validation_seed_meta.data
+                if isinstance(validation_seed_meta, NonTensorData)
+                else validation_seed_meta if validation_seed_meta is not None else config.val_kwargs.seed
+            )
             # Re-assert global_steps in case the val_kwargs update above is ever
             # extended to carry a "global_steps" key in the future.
             if global_steps is not None:
@@ -139,12 +145,14 @@ class DiffusionAgentLoopWorkerTQ(DiffusionAgentLoopWorker):
             n = config.val_kwargs.n if trajectory["validate"] else config.n
             for session_id in range(n):
                 run_sampling_params = dict(sampling_params)
-                if rollout_base_seed is not None and not trajectory["validate"]:
-                    # Seed from the position within the generation batch (v0
-                    # semantics): each worker only sees a chunk of the batch, so
-                    # a chunk-local position would reuse the same seed offsets
-                    # in every worker and roll out duplicated noise.
-                    run_sampling_params["seed"] = derive_rollout_seed(rollout_base_seed, prompt_index * n + session_id)
+                if rollout_base_seed is not None:
+                    expanded_index = prompt_index * n + session_id
+                    if trajectory["validate"]:
+                        run_sampling_params["seed"] = rollout_base_seed + expanded_index
+                    else:
+                        # Each worker sees a chunk; a chunk-local index would
+                        # duplicate training noise across workers.
+                        run_sampling_params["seed"] = derive_rollout_seed(rollout_base_seed, expanded_index)
                 task = asyncio.create_task(
                     self._run_agent_loop(
                         run_sampling_params,

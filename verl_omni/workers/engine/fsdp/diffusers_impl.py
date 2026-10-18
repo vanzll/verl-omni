@@ -717,12 +717,13 @@ class DiffusersFSDPEngine(LoRAAdapterMixin, BaseEngine, ABC):
         if isinstance(grad_norm, DTensor):
             grad_norm = grad_norm.full_tensor()
 
-        # if grad_norm is not finite, skip the update
+        # A skipped update must not be counted as a completed training step.
+        # Stop the attempt so its next checkpoint can only be resumed from a
+        # known complete optimizer/rollout boundary.
         if not torch.isfinite(grad_norm):
-            logger.warning("grad_norm is not finite: %s; skipping this optimizer step.", grad_norm)
             self.optimizer.zero_grad()
-        else:
-            self.optimizer.step()
+            raise FloatingPointError(f"Non-finite grad_norm {grad_norm}; optimizer step was not applied.")
+        self.optimizer.step()
         return grad_norm.item()
 
     def lr_scheduler_step(self):
@@ -1614,6 +1615,109 @@ class NFTDiffusersFSDPEngine(DiffusersFSDPEngine):
             "metrics": metrics,
         }
         return loss, output
+
+
+@EngineRegistry.register(model_type="omni_nft_model", backend=["fsdp2"], device=["cuda"])
+class OmniNFTDiffusersFSDPEngine(NFTDiffusersFSDPEngine):
+    """PR #640's two-modal forward-process NFT on the current shared FSDP engine.
+
+    The policy, old adapter and reference adapter each see the same noised
+    video/audio state. Each modality keeps its own prediction and loss terms.
+    """
+
+    @staticmethod
+    def _select_forward_noise(micro_batch: TensorDict, key: str, x0: torch.Tensor, step: int) -> torch.Tensor:
+        noise = micro_batch.get(key, None)
+        if noise is None:
+            return torch.randn_like(x0.float())
+        return noise[:, step] if noise.ndim == x0.ndim + 1 else noise
+
+    def prepare_model_inputs(self, micro_batch: TensorDict, step: int):
+        video_x0 = micro_batch["video_latents_clean"]
+        audio_x0 = micro_batch["audio_latents_clean"]
+        timestep = micro_batch["train_timesteps"][:, step]
+        t = self._flow_time(micro_batch, timestep, video_x0.ndim)
+        video_noise = self._select_forward_noise(micro_batch, "video_forward_noise", video_x0, step)
+        audio_noise = self._select_forward_noise(micro_batch, "audio_forward_noise", audio_x0, step)
+        video_xt = (1.0 - t) * video_x0 + t * video_noise
+        audio_xt = (1.0 - t) * audio_x0 + t * audio_noise
+        model_inputs, negative_model_inputs = self._prepare_conditioned_inputs(
+            micro_batch, torch.cat((video_xt, audio_xt), dim=1), timestep, step
+        )
+        return model_inputs, negative_model_inputs, (video_x0, audio_x0), (video_xt, audio_xt), (t, t)
+
+    @staticmethod
+    def prepare_model_outputs(output, micro_batch: TensorDict) -> dict[str, torch.Tensor]:
+        del micro_batch
+        old, current, reference, x0, xt, flow_time = output
+        video_old, audio_old = old
+        video_current, audio_current = current
+        video_reference, audio_reference = reference
+        video_x0, audio_x0 = x0
+        video_xt, audio_xt = xt
+        video_t, audio_t = flow_time
+        return {
+            "video_old_prediction": video_old,
+            "audio_old_prediction": audio_old,
+            "video_forward_prediction": video_current,
+            "audio_forward_prediction": audio_current,
+            "video_ref_forward_prediction": video_reference,
+            "audio_ref_forward_prediction": audio_reference,
+            "video_x0": video_x0,
+            "audio_x0": audio_x0,
+            "video_xt": video_xt,
+            "audio_xt": audio_xt,
+            "video_t_expanded": video_t,
+            "audio_t_expanded": audio_t,
+        }
+
+    def forward_step(self, micro_batch: TensorDict, loss_function, forward_only, step):
+        model_inputs, negative_model_inputs, x0, xt, flow_time = self.prepare_model_inputs(micro_batch, step)
+        with self.use_adapter("old"), torch.no_grad():
+            old_prediction = tuple(
+                prediction.detach()
+                for prediction in forward(
+                    module=self.module,
+                    model_config=self.model_config,
+                    model_inputs=model_inputs,
+                    negative_model_inputs=negative_model_inputs,
+                )
+            )
+        current_prediction = forward(
+            module=self.module,
+            model_config=self.model_config,
+            model_inputs=model_inputs,
+            negative_model_inputs=negative_model_inputs,
+        )
+        with torch.no_grad(), self.disable_adapter():
+            reference_prediction = tuple(
+                prediction.detach()
+                for prediction in forward(
+                    module=self.module,
+                    model_config=self.model_config,
+                    model_inputs=model_inputs,
+                    negative_model_inputs=negative_model_inputs,
+                )
+            )
+        self._set_adapter("default")
+        model_output = self.prepare_model_outputs(
+            (old_prediction, current_prediction, reference_prediction, x0, xt, flow_time), micro_batch
+        )
+        if loss_function is not None:
+            data = tu.get_tensordict({"reward_prob": micro_batch["reward_prob"][:, step]})
+            tu.assign_non_tensor(
+                data,
+                gradient_accumulation_steps=tu.get_non_tensor_data(
+                    micro_batch, "gradient_accumulation_steps", default=None
+                ),
+                sp_size=tu.get_non_tensor_data(micro_batch, "sp_size", default=None),
+            )
+            loss, metrics = loss_function(model_output=model_output, data=data, dp_group=self.get_data_parallel_group())
+        else:
+            assert forward_only, "forward_only must be True when loss_function is None"
+            loss = torch.tensor(1.0, device=x0[0].device)
+            metrics = {}
+        return loss, {"model_output": model_output, "loss": loss.detach().item(), "metrics": metrics}
 
 
 @EngineRegistry.register(model_type="diffusion_art_model", backend=["fsdp", "fsdp2"], device=["cuda", "npu"])

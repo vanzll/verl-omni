@@ -32,7 +32,13 @@ from tensordict import TensorDict
 from verl import DataProto
 from verl.utils import tensordict_utils as tu
 
-from verl_omni.trainer.diffusion.diffusion_art import art_guidance, art_loss, art_pairwise_labels, group_index_from_uid
+from verl_omni.trainer.diffusion.diffusion_art import (
+    art_guidance,
+    art_loss,
+    art_pairwise_labels,
+    art_prompt_balanced_indices,
+    group_index_from_uid,
+)
 from verl_omni.workers.config import DiffusionActorConfig
 
 logger = logging.getLogger(__name__)
@@ -908,6 +914,10 @@ class DiffusionNFTLoss(DiffusionLossFn):
                 "actor/ref_kl_contribution": (loss_cfg.ref_kl_coef * ref_kl_loss).detach().item(),
                 "actor/old_deviate": ((forward_prediction - old_prediction) ** 2).mean().detach().item(),
                 "actor/reward_prob_mean": reward_weight.mean().detach().item(),
+                "actor/reward_prob_std": reward_weight.float().std(unbiased=False).detach().item(),
+                "actor/reward_prob_saturation_frac": (
+                    ((reward_weight <= 1e-6) | (reward_weight >= 1.0 - 1e-6)).float().mean().detach().item()
+                ),
                 "actor/total_loss": loss.detach().item(),
             }
         return loss, metrics
@@ -1153,6 +1163,10 @@ class OmniNFTLoss(DiffusionNFTLoss):
             "ref_kl_loss": ref_loss,
             "old_deviate": (forward_prediction - old_prediction).square().mean(),
             "reward_prob_mean": reward_weight.mean(),
+            "reward_prob_std": reward_weight.float().std(unbiased=False),
+            "reward_prob_saturation_frac": (
+                (reward_weight <= 1e-6) | (reward_weight >= 1.0 - 1e-6)
+            ).float().mean(),
         }
         return policy_loss, ref_loss, details
 
@@ -1996,6 +2010,19 @@ class DiffusionARTLoss(DiffusionLossFn):
                 "per-rank micro-batching check below does not model; DiffusionART's pairwise variant is "
                 "algorithm.art_pairwise_reward)"
             )
+        if algorithm_cfg.get("art_prompt_balanced_split", False):
+            if int(rollout_cfg.n) % 2:
+                problems.append("art_prompt_balanced_split needs an even rollout.n")
+            if int(config.data.train_batch_size) != 2 * int(actor_cfg.ppo_mini_batch_size):
+                problems.append("art_prompt_balanced_split needs exactly two optimizer mini batches per rollout")
+            if actor_cfg.get("shuffle", False):
+                problems.append("art_prompt_balanced_split needs actor.shuffle=False to preserve its two windows")
+        if algorithm_cfg.get("art_prompt_balanced_split", False) and algorithm_cfg.get("art_joint_reward_routing", False):
+            problems.append("art_prompt_balanced_split and art_joint_reward_routing are separate ablations")
+        if algorithm_cfg.get("art_pairwise_reward", False) and (
+            algorithm_cfg.get("art_prompt_balanced_split", False) or algorithm_cfg.get("art_joint_reward_routing", False)
+        ):
+            problems.append("art_prompt_balanced_split and art_joint_reward_routing require scalar rewards")
         for key in ("guidance_scale", "true_cfg_scale", "video_cfg_scale", "audio_cfg_scale"):
             model_value = OmegaConf.select(config, f"actor_rollout_ref.model.pipeline.{key}", default=None)
             rollout_value = OmegaConf.select(config, f"actor_rollout_ref.rollout.pipeline.{key}", default=None)
@@ -2177,6 +2204,8 @@ class DiffusionARTLoss(DiffusionLossFn):
         """
         rewards = reward_tensor.detach().float().cpu()
         if modalities == [""]:
+            if config.algorithm.get("art_joint_reward_routing", False):
+                raise ValueError("ART joint reward routing requires video and audio modalities.")
             return {"": rewards}, None
         algorithm_cfg = config.algorithm
         routing = algorithm_cfg.get("art_modality_reward_weights", None)
@@ -2194,6 +2223,8 @@ class DiffusionARTLoss(DiffusionLossFn):
                         if value > 0:
                             routing.setdefault(modality, {})[name] = value
         if not routing:
+            if algorithm_cfg.get("art_joint_reward_routing", False):
+                raise ValueError("ART joint reward routing requires named component routes.")
             return {modality: rewards for modality in modalities}, None
         names = sorted({name for weights in routing.values() for name in weights})
         uid = batch.non_tensor_batch["uid"]
@@ -2209,6 +2240,24 @@ class DiffusionARTLoss(DiffusionLossFn):
             ],
             dim=1,
         )
+        if algorithm_cfg.get("art_joint_reward_routing", False):
+            if set(modalities) != {"video", "audio"}:
+                raise ValueError("ART joint reward routing requires video and audio modalities.")
+            joint_weights: dict[str, float] = {}
+            for weights in routing.values():
+                for name, weight in weights.items():
+                    value = float(weight)
+                    if value == 0.0:
+                        continue
+                    if name in joint_weights and joint_weights[name] != value:
+                        raise ValueError(f"ART joint reward routing has conflicting weights for {name!r}.")
+                    joint_weights[name] = value
+            if not joint_weights:
+                raise ValueError("ART joint reward routing has no nonzero component weights.")
+            # A component shared by both routes (DeSync in the LTX recipe) enters once.
+            vector = torch.tensor([joint_weights.get(name, 0.0) for name in names])
+            joint_reward = components @ vector
+            return {modality: joint_reward for modality in modalities}, (components, names)
         routed = {}
         for modality in modalities:
             weights = dict(routing.get(modality) or {})
@@ -2221,6 +2270,68 @@ class DiffusionARTLoss(DiffusionLossFn):
             vector = torch.tensor([float(weights.get(name, 0.0)) for name in names])
             routed[modality] = components @ vector
         return routed, (components, names)
+
+    @staticmethod
+    @torch.no_grad()
+    def _cross_covariance_probe(
+        endpoints: torch.Tensor,
+        segments: list[tuple[str, slice]],
+        group_index: torch.Tensor,
+        standardized: tuple[torch.Tensor, list[str]],
+        reward_functions: Any,
+        max_groups: int = 4,
+    ) -> dict[str, torch.Tensor]:
+        """Measure same- and cross-route covariance on fixed first prompt groups.
+
+        A reward shared by both routes belongs to the same-route term for each
+        modality and is excluded from its cross-route term. Thus the two terms
+        sum to the once-counted joint reward covariance for either modality.
+        """
+        if [name for name, _ in segments] != ["video", "audio"]:
+            return {}
+        scores, names = standardized
+        if any(name not in reward_functions for name in names):
+            return {}
+        weights = {
+            modality: torch.tensor(
+                [float(reward_functions[name].get("routing_weights", {}).get(modality, 0.0)) for name in names],
+                dtype=torch.float32,
+            )
+            for modality in ("video", "audio")
+        }
+        groups = torch.unique(group_index, sorted=True)[:max_groups]
+        if not groups.numel():
+            return {}
+        metrics: dict[str, torch.Tensor] = {}
+        for modality, latent_slice in segments:
+            other = "audio" if modality == "video" else "video"
+            same_weights = weights[modality]
+            cross_weights = torch.where(same_weights == 0, weights[other], 0.0)
+            latent = endpoints[:, latent_slice].float().flatten(1)
+            same_reward = scores.float() @ same_weights
+            cross_reward = scores.float() @ cross_weights
+            same_rms, cross_rms, joint_rms, cosine = [], [], [], []
+            for group in groups:
+                rows = group_index == group
+                states = latent[rows]
+                same = same_reward[rows]
+                cross = cross_reward[rows]
+                same_cov = ((same - same.mean())[:, None] * states).mean(dim=0)
+                cross_cov = ((cross - cross.mean())[:, None] * states).mean(dim=0)
+                same_rms.append(same_cov.square().mean().sqrt())
+                cross_rms.append(cross_cov.square().mean().sqrt())
+                joint_rms.append((same_cov + cross_cov).square().mean().sqrt())
+                norm_product = same_cov.norm() * cross_cov.norm()
+                cosine.append(
+                    torch.where(norm_product > 0, (same_cov * cross_cov).sum() / norm_product.clamp_min(1e-30), 0.0)
+                )
+            prefix = f"cov_probe/{modality}/"
+            metrics[f"{prefix}same_rms"] = torch.stack(same_rms).mean()
+            metrics[f"{prefix}cross_rms"] = torch.stack(cross_rms).mean()
+            metrics[f"{prefix}joint_rms"] = torch.stack(joint_rms).mean()
+            metrics[f"{prefix}same_cross_cosine"] = torch.stack(cosine).mean()
+            metrics[f"{prefix}groups"] = torch.tensor(float(len(groups)))
+        return metrics
 
     @classmethod
     def prepare_actor_batch(
@@ -2270,13 +2381,38 @@ class DiffusionARTLoss(DiffusionLossFn):
         modality_rewards, standardized = cls._modality_rewards(
             batch, reward_tensor, config, [name for name, _ in segments]
         )
+        probe_step = cls._global_step(batch)
+        if standardized is not None and probe_step is not None and (probe_step == 1 or probe_step % 10 == 0):
+            batch_metrics.update(
+                cls._cross_covariance_probe(
+                    endpoints, segments, group_index, standardized, config.reward.reward_functions
+                )
+            )
         pairwise = bool(algorithm_cfg.get("art_pairwise_reward", False))
         step_seed = cls._step_seed(batch, int(actor_cfg.data_loader_seed))
+        balanced_order = None
+        balanced_dp_size = None
+        if algorithm_cfg.get("art_prompt_balanced_split", False):
+            world_size = int(config.trainer.n_gpus_per_node) * int(config.trainer.nnodes)
+            sp_size = int(actor_cfg.fsdp_config.ulysses_sequence_parallel_size)
+            if world_size % sp_size:
+                raise ValueError(f"ART A1 world size {world_size} is not divisible by actor SP size {sp_size}.")
+            balanced_dp_size = world_size // sp_size
+            balanced_order = art_prompt_balanced_indices(
+                uid, int(config.actor_rollout_ref.rollout.n), step_seed, dp_size=balanced_dp_size
+            )
 
         guidance = torch.zeros_like(endpoints)
         anchors = []
         any_active = False
         records: dict[str, torch.Tensor] = {}
+        if balanced_order is not None:
+            update_window = torch.empty(batch_size, dtype=torch.float32)
+            rank_rows = balanced_order.reshape(balanced_dp_size, batch_size // balanced_dp_size)
+            half_rank = rank_rows.shape[1] // 2
+            update_window[torch.from_numpy(rank_rows[:, :half_rank].reshape(-1))] = 0.0
+            update_window[torch.from_numpy(rank_rows[:, half_rank:].reshape(-1))] = 1.0
+            records["update_window"] = update_window
         for name, rows in segments:
             rewards = modality_rewards[name]
             label = name or "reward"
@@ -2374,6 +2510,8 @@ class DiffusionARTLoss(DiffusionLossFn):
         for key in ("all_latents", "all_next_latents", "all_log_probs", "all_segment_timesteps"):
             if key in batch.batch.keys():
                 del batch.batch[key]
+        if balanced_order is not None:
+            batch.reorder(torch.from_numpy(balanced_order))
         return batch
 
 

@@ -223,6 +223,16 @@ class DiffusionAgentLoopWorker:
             sampling_params.update(_config_to_sampling_dict(config.val_kwargs.algo))
             sampling_params["seed"] = config.val_kwargs.seed
             sampling_params["logprobs"] = False
+            # Keep validation noise fixed per expanded sample across checkpoints
+            # and independent of agent worker packing or request completion order.
+            global_indices = batch.non_tensor_batch.get("_rollout_seed_global_idx")
+            if global_indices is not None:
+                global_indices = np.asarray(global_indices, dtype=np.int64).reshape(-1)
+            validation_base_seed = int(batch.meta_info.get("rollout_seed", config.val_kwargs.seed))
+            indices = range(len(batch)) if global_indices is None else global_indices
+            # Public LTX frame sheets use seed 42 + prompt index. The eight
+            # validation prompts use this fixed per-row rule at every eval.
+            per_rollout_seeds = [validation_base_seed + int(index) for index in indices]
         else:
             sampling_params["global_steps"] = batch.meta_info["global_steps"]
             # Prefer trainer-assigned global indices so chunked workers derive the

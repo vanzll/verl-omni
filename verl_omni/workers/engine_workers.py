@@ -190,6 +190,7 @@ class TrainingWorker(Worker, DistProfilerExtension):
             "diffusion_model",
             "diffusion_dpo_model",
             "diffusion_nft_model",
+            "omni_nft_model",
             "diffusion_art_model",
         ):
             self.flops_counter = DiffusionFlopsCounter(
@@ -402,6 +403,11 @@ class TrainingWorker(Worker, DistProfilerExtension):
                                 else list(chain.from_iterable(val))
                             )
                     append_to_dict(metrics, output)
+
+                # Each train_batch returned only after optimizer_step applied.
+                # Non-finite gradients now raise, so this counts successful
+                # global updates once rather than once per data-parallel rank.
+                metrics["optimizer_updates"] = [total_num_iterations]
 
                 output = tu.get_tensordict(tensor_dict={}, non_tensor_dict={"metrics": metrics}).cpu()
             else:
@@ -644,6 +650,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             "diffusion_model",
             "diffusion_dpo_model",
             "diffusion_nft_model",
+            "omni_nft_model",
             "diffusion_art_model",
         )
 

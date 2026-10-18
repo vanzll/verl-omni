@@ -36,6 +36,42 @@ from verl_omni.workers.rollout.vllm_rollout.vllm_omni_diffusion_strategy import 
 
 
 @pytest.mark.parametrize(
+    ("algorithm", "pipeline_class"),
+    [("diffusion_art", "ltx2_diffusion_art.config.LTXARTPipelineConfig"),
+     ("omni_nft", "ltx2_omni_nft.config.LTXDiffusionPipelineConfig")],
+)
+@pytest.mark.parametrize("as_dict", [False, True])
+def test_diffusion_model_config_preserves_pipeline_target(tmp_path, algorithm, pipeline_class, as_dict):
+    import json
+
+    from omegaconf import OmegaConf
+
+    from verl_omni.workers.config import DiffusionModelConfig
+
+    (tmp_path / "model_index.json").write_text(json.dumps({"_class_name": "LTX2Pipeline"}))
+    config = OmegaConf.create({
+        "_target_": "verl_omni.workers.config.diffusion.DiffusionModelConfig",
+        "path": str(tmp_path), "algorithm": algorithm,
+        "load_tokenizer": False, "attn_backend": "native",
+        "pipeline": {
+            "_target_": f"verl_omni.pipelines.{pipeline_class}",
+            "video_cfg_scale": 1.5, "audio_cfg_scale": 3.0,
+            "video_modality_scale": 1.0, "audio_modality_scale": 1.0,
+            "video_rescale_scale": 0.0, "audio_rescale_scale": 0.0,
+        },
+    })
+    raw = OmegaConf.to_container(config) if as_dict else config
+    strategy = DiffusionStrategy(SimpleNamespace())
+    model = strategy.init_model_config(raw)
+    assert isinstance(model, DiffusionModelConfig)
+    assert model.pipeline.__class__.__name__ == pipeline_class.rsplit(".", 1)[1]
+    assert model.pipeline.video_cfg_scale == 1.5
+    assert model.pipeline.audio_cfg_scale == 3.0
+    assert model.pipeline.video_rescale_scale == 0.0
+    assert strategy.init_model_config(model) is model
+
+
+@pytest.mark.parametrize(
     ("output_mode", "expected_kind"),
     [("ar", "ar"), ("diffusion", "diffusion"), (None, "diffusion")],
 )

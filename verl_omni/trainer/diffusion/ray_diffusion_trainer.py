@@ -18,11 +18,13 @@ This trainer supports model-agnostic model initialization with Hugging Face.
 
 import json
 import logging
+import math
 import os
 import subprocess
+import time
 import uuid
 from abc import ABC, abstractmethod
-from collections import defaultdict
+from collections import Counter, defaultdict
 from pprint import pprint
 from typing import Any, Literal, Optional
 
@@ -61,6 +63,12 @@ from verl_omni.pipelines.rollout_media import (
     validate_visual_media_batch_rank,
 )
 from verl_omni.trainer.config import DiffusionAlgoConfig
+from verl_omni.trainer.diffusion.diffusion_checkpoint import (
+    latest_complete_rollout,
+    restore_controller_state,
+    save_complete_rollout,
+    validate_complete_rollout,
+)
 from verl_omni.trainer.diffusion.diffusion_algos import (
     DiffusionAdvantageEstimator,
     get_diffusion_adv_estimator_fn,
@@ -783,6 +791,16 @@ class BaseRayDiffusionTrainer(ABC):
                 "validate": True,
                 "global_steps": self.global_steps,
             }
+            # Validation uses the same sample identities at every checkpoint.
+            # Unlike training, the validation loop did not pass a per-sample seed
+            # to the diffusion agent loop, so server scheduling could change the
+            # generated noise and obscure a same-prompt comparison.
+            validation_seed = self.config.actor_rollout_ref.rollout.get("seed", None)
+            if validation_seed is not None:
+                test_gen_batch.meta_info["rollout_seed"] = int(validation_seed)
+                test_gen_batch.non_tensor_batch["_rollout_seed_global_idx"] = np.arange(
+                    len(test_gen_batch), dtype=np.int64
+                )
             print(f"test_gen_batch meta info: {test_gen_batch.meta_info}")
 
             # pad to be divisible by dp_size
@@ -907,6 +925,21 @@ class BaseRayDiffusionTrainer(ABC):
             metric_dict["val-aux/num_turns/min"] = sample_turns.min()
             metric_dict["val-aux/num_turns/max"] = sample_turns.max()
             metric_dict["val-aux/num_turns/mean"] = sample_turns.mean()
+
+        if self.config.trainer.get("expected_optimizer_updates_per_rollout", None) is not None:
+            names, weights = self._campaign_reward_names_weights()
+            if any(f"reward/{name}" not in reward_extra_infos_dict for name in names):
+                raise RuntimeError("Campaign validation is missing raw per-scorer rewards.")
+            scores = np.stack(
+                [np.asarray(reward_extra_infos_dict[f"reward/{name}"], dtype=np.float32) for name in names], axis=1
+            )
+            if scores.ndim != 2 or scores.shape[1] != len(names) or not np.isfinite(scores).all():
+                raise FloatingPointError(f"Invalid campaign validation reward matrix shape={scores.shape}.")
+            for index, name in enumerate(names):
+                metric_dict[f"val/reward_raw/{name}/mean"] = float(scores[:, index].mean())
+            weighted = scores @ weights
+            metric_dict["val/reward_weighted_total/mean"] = float(weighted.mean())
+            metric_dict["val/reward_weighted_total/std"] = float(weighted.std())
 
         return metric_dict
 
@@ -1115,6 +1148,10 @@ class BaseRayDiffusionTrainer(ABC):
             self.checkpoint_manager.sleep_replicas()
 
     def _save_checkpoint(self):
+        if self.config.trainer.get("expected_optimizer_updates_per_rollout", None) is not None:
+            save_complete_rollout(self)
+            return
+
         from verl.utils.fs import local_mkdir_safe
 
         # path: given_path + `/global_step_{global_steps}` + `/actor`
@@ -1176,6 +1213,13 @@ class BaseRayDiffusionTrainer(ABC):
                 working_dir = os.getcwd()
                 checkpoint_folder = os.path.join(working_dir, checkpoint_folder)
             global_step_folder = find_latest_ckpt_path(checkpoint_folder)  # None if no latest
+            if (
+                self.config.trainer.resume_mode == "auto"
+                and self.config.trainer.get("expected_optimizer_updates_per_rollout", None) is not None
+            ):
+                published = latest_complete_rollout(checkpoint_folder)
+                if published is not None:
+                    global_step_folder = published
 
         # find global_step_folder
         if self.config.trainer.resume_mode == "auto":
@@ -1198,6 +1242,10 @@ class BaseRayDiffusionTrainer(ABC):
                     "Available options: ['disable', 'auto', 'resume_path']."
                 )
         print(f"Load from checkpoint folder: {global_step_folder}")
+        controller_state = None
+        if self.config.trainer.get("expected_optimizer_updates_per_rollout", None) is not None:
+            controller_state = validate_complete_rollout(global_step_folder, self.config)
+
         # set global step
         self.global_steps = int(global_step_folder.split("global_step_")[-1])
 
@@ -1217,6 +1265,8 @@ class BaseRayDiffusionTrainer(ABC):
             self.train_dataloader.load_state_dict(dataloader_state_dict)
         else:
             print(f"Warning: No dataloader state found at {dataloader_local_path}, will start from scratch")
+        if controller_state is not None:
+            restore_controller_state(self, controller_state)
 
     def _update_actor(self, batch: DataProto) -> DataProto:
         rollout_config = self.config.actor_rollout_ref.rollout
@@ -1245,6 +1295,7 @@ class BaseRayDiffusionTrainer(ABC):
         actor_output = self.actor_rollout_wg.update_actor(batch_td)
         actor_output = tu.get(actor_output, "metrics")
         actor_output = rename_dict(actor_output, "actor/")
+        self._assert_campaign_worker_updates(actor_output)
         if (actor_mfu := actor_output.pop("actor/mfu", None)) is not None:
             actor_output["perf/mfu/actor"] = actor_mfu
         return DataProto.from_single_dict(data={}, meta_info={"metrics": actor_output})
@@ -1295,6 +1346,120 @@ class BaseRayDiffusionTrainer(ABC):
                     get_platform().profiler_stop()
                 finally:
                     self._controller_nsys_profile_active = False
+
+    def _start_campaign_clock(self) -> None:
+        """Include GPU-reserved initialization before fit; keep attempt intervals separate."""
+        self._campaign_fit_start = time.monotonic()
+        self._campaign_training_gpu_seconds = 0.0
+        start = float(self.config.trainer.get("gpu_reservation_start_unix_mean", 0.0))
+        extra = float(self.config.trainer.get("resume_extra_end_to_end_gpu_seconds", 0.0))
+        now = time.time()
+        if not math.isfinite(start) or start < 0 or start > now + 1:
+            raise ValueError("Invalid GPU reservation start time")
+        if not math.isfinite(extra) or extra < 0:
+            raise ValueError("Invalid extra resume GPU cost")
+        self._campaign_attempt_startup_gpu_seconds = (
+            self.resource_pool_manager.get_n_gpus() * max(0.0, now - start) if start > 0 else 0.0
+        )
+        self._campaign_resume_extra_gpu_seconds = extra
+        self._campaign_prior_end_to_end_gpu_seconds = self._campaign_attempt_startup_gpu_seconds + extra
+
+    def _record_campaign_progress(self, metrics: dict, timing_raw: dict, n_gpus: int, num_samples: int) -> None:
+        """Audit the rollout/update budget when this campaign enables the guard."""
+        expected = self.config.trainer.get("expected_optimizer_updates_per_rollout", None)
+        if expected is None:
+            return
+        actual = metrics.get("actor/optimizer_updates", None)
+        if actual is None or not math.isfinite(float(actual)) or float(actual) != int(expected):
+            raise RuntimeError(f"Expected {expected} successful optimizer updates in rollout, got {actual}.")
+        expected_samples = self.config.trainer.get("expected_generated_samples_per_rollout", None)
+        if expected_samples is not None and num_samples != int(expected_samples):
+            raise RuntimeError(f"Expected {expected_samples} complete trajectories, got {num_samples}.")
+        if not hasattr(self, "_campaign_fit_start"):
+            raise RuntimeError("Campaign clock must start before initial validation.")
+        self._campaign_training_gpu_seconds += n_gpus * max(
+            0.0, timing_raw["step"] - timing_raw.get("save_checkpoint", 0.0)
+        )
+        metrics.update(
+            {
+                "progress/rollout": self.global_steps,
+                "progress/optimizer_updates": self.global_steps * int(expected),
+                "progress/generated_samples": self.global_steps * num_samples,
+                "cost/training_gpu_hours": self._campaign_training_gpu_seconds / 3600.0,
+                "cost/end_to_end_gpu_hours": (self._campaign_prior_end_to_end_gpu_seconds
+                    + n_gpus * (time.monotonic() - self._campaign_fit_start)) / 3600.0,
+            }
+        )
+
+    def _campaign_reward_names_weights(self) -> tuple[list[str], np.ndarray]:
+        """Build the once-counted total from the configured modality routes."""
+        reward_functions = self.config.reward.reward_functions
+        names = sorted(reward_functions)
+        weights = []
+        for name in names:
+            routes = reward_functions[name].routing_weights
+            video, audio = float(routes.video), float(routes.audio)
+            if video > 0 and audio > 0 and video != audio:
+                raise ValueError(f"Shared reward {name} has conflicting video/audio weights.")
+            weights.append(max(video, audio))
+        return names, np.asarray(weights, dtype=np.float32)
+
+    def _campaign_weighted_reward_metrics(self, batch: DataProto) -> dict[str, float]:
+        """Log the same raw five-scorer total for every campaign arm.
+
+        The reward manager's `combined` score uses its own `weight` fields,
+        while this comparison uses routing weights with a shared scorer once.
+        """
+        if self.config.trainer.get("expected_optimizer_updates_per_rollout", None) is None:
+            return {}
+        names, weights = self._campaign_reward_names_weights()
+        if all(f"reward/{name}" in batch.non_tensor_batch for name in names):
+            columns = [np.asarray(batch.non_tensor_batch[f"reward/{name}"], dtype=np.float32) for name in names]
+            scores = np.stack(columns, axis=1)
+        elif "rm_scores" in batch.batch and "reward_names" in batch.meta_info:
+            actual_names = list(batch.meta_info["reward_names"])
+            columns = batch.batch["rm_scores"].detach().float().cpu().numpy()
+            scores = columns[:, [actual_names.index(name) for name in names]]
+        else:
+            raise RuntimeError("Campaign requires raw per-scorer rewards for the matched weighted-total audit.")
+        if scores.ndim != 2 or scores.shape != (len(batch), len(names)) or not np.isfinite(scores).all():
+            raise FloatingPointError(f"Invalid campaign raw reward matrix shape={scores.shape}.")
+        total = scores @ weights
+        result = {f"train/reward_raw/{name}/mean": float(scores[:, index].mean()) for index, name in enumerate(names)}
+        result["train/reward_weighted_total/mean"] = float(total.mean())
+        result["train/reward_weighted_total/std"] = float(total.std())
+        return result
+
+    def _campaign_omninft_reward_prob_metrics(self, batch: DataProto) -> dict[str, float]:
+        """Full-rollout modality weight spread, before DP/microbatch splitting."""
+        if self.config.trainer.get("expected_optimizer_updates_per_rollout", None) is None:
+            return {}
+        if self.config.actor_rollout_ref.model.algorithm != "omni_nft":
+            return {}
+        probabilities = batch.batch.get("reward_prob", None)
+        if probabilities is None or probabilities.ndim != 3 or probabilities.shape[-1] != 2:
+            raise RuntimeError("Campaign OmniNFT reward_prob must have shape [samples, timesteps, 2].")
+        values = probabilities[:, 0, :].detach().float()
+        if not torch.isfinite(values).all():
+            raise FloatingPointError("Campaign OmniNFT reward_prob contains NaN/Inf.")
+        result = {}
+        for index, name in enumerate(("video", "audio")):
+            column = values[:, index]
+            result[f"train/omninft/reward_prob_{name}_mean"] = float(column.mean())
+            result[f"train/omninft/reward_prob_{name}_std"] = float(column.std(unbiased=False))
+            result[f"train/omninft/reward_prob_{name}_saturation_frac"] = float(
+                ((column <= 1e-6) | (column >= 1.0 - 1e-6)).float().mean()
+            )
+        return result
+
+    def _assert_campaign_worker_updates(self, worker_metrics: dict) -> None:
+        """Check completed updates before the trainer can publish a checkpoint."""
+        expected = self.config.trainer.get("expected_optimizer_updates_per_rollout", None)
+        if expected is None:
+            return
+        actual = reduce_metrics(worker_metrics).get("actor/optimizer_updates", None)
+        if actual is None or not math.isfinite(float(actual)) or float(actual) != int(expected):
+            raise RuntimeError(f"Expected {expected} successful optimizer updates in rollout, got {actual}.")
 
     @abstractmethod
     def fit(self):
@@ -1365,6 +1530,7 @@ class PolicyGradientRayTrainer(BaseRayDiffusionTrainer):
             default_backend=self.config.trainer.logger,
             config=OmegaConf.to_container(self.config, resolve=True),
         )
+        self._start_campaign_clock()
 
         self.global_steps = 0
 
@@ -1376,7 +1542,10 @@ class PolicyGradientRayTrainer(BaseRayDiffusionTrainer):
 
         # perform validation before training
         # currently, we only support validation using the reward_function.
-        if self.config.trainer.get("val_before_train", True):
+        if self.config.trainer.get("val_before_train", True) and not (
+            self.global_steps > 0
+            and self.config.trainer.get("expected_optimizer_updates_per_rollout", None) is not None
+        ):
             val_metrics = self._validate()
             assert val_metrics, f"{val_metrics=}"
             pprint(f"Initial validation metrics: {val_metrics}")
@@ -1408,6 +1577,7 @@ class PolicyGradientRayTrainer(BaseRayDiffusionTrainer):
                     self.actor_rollout_wg.async_calls_finalize_fn_exec(blocking=False)
                 metrics = {}
                 timing_raw = {}
+                self._campaign_checkpoint_pending = False
 
                 with marked_timer("start_profile", timing_raw):
                     self._start_profiling(
@@ -1567,8 +1737,11 @@ class PolicyGradientRayTrainer(BaseRayDiffusionTrainer):
                     ):
                         if esi_close_to_expiration:
                             print("Force saving checkpoint: ESI instance expiration approaching.")
-                        with marked_timer("save_checkpoint", timing_raw, color="green"):
-                            self._save_checkpoint()
+                        if self.config.trainer.get("expected_optimizer_updates_per_rollout", None) is not None:
+                            self._campaign_checkpoint_pending = True
+                        else:
+                            with marked_timer("save_checkpoint", timing_raw, color="green"):
+                                self._save_checkpoint()
 
                     # update weights from trainer to rollout
                     with marked_timer("update_weights", timing_raw, color="red"):
@@ -1624,12 +1797,21 @@ class PolicyGradientRayTrainer(BaseRayDiffusionTrainer):
                 metrics.update(compute_timing_metrics_diffusion(timing_raw=timing_raw, num_images=num_images))
                 metrics.update(compute_throughput_metrics_diffusion(batch=batch, timing_raw=timing_raw, n_gpus=n_gpus))
                 metrics.update(compute_reward_extra_metrics_diffusion(reward_extra_infos_dict))
+                self._record_campaign_progress(metrics, timing_raw, n_gpus, num_images)
                 # compute variance proxy metrics
                 gradient_norm = metrics.get("actor/grad_norm", None)
                 metrics.update(compute_variance_proxy_metrics(batch=batch, gradient_norm=gradient_norm))
                 self._nonfinite_grad_streak = track_nonfinite_grad_streak(self._nonfinite_grad_streak, gradient_norm)
                 metrics["train/nonfinite_grad_steps"] = self._nonfinite_grad_streak
 
+                if self._campaign_checkpoint_pending:
+                    with marked_timer("save_checkpoint", timing_raw, color="green"):
+                        self._save_checkpoint()
+                    metrics["timing_s/save_checkpoint"] = timing_raw["save_checkpoint"]
+                    metrics["cost/end_to_end_gpu_hours"] = (
+                        self._campaign_prior_end_to_end_gpu_seconds
+                        + n_gpus * (time.monotonic() - self._campaign_fit_start)
+                    ) / 3600.0
                 logger.log(data=metrics, step=self.global_steps)
 
                 progress_bar.update(1)
@@ -1700,6 +1882,8 @@ class DirectPreferenceRayTrainer(BaseRayDiffusionTrainer):
         return super()._validate()
 
     def _update_actor(self, batch: DataProto) -> DataProto:
+        if self.config.actor_rollout_ref.model.algorithm == "diffusion_art":
+            self._audit_art_update_windows(batch)
         rollout_config = self.config.actor_rollout_ref.rollout
         batch.meta_info["multi_turn"] = rollout_config.multi_turn.enable
         batch_td = _to_diffusion_worker_tensordict(batch)
@@ -1738,9 +1922,78 @@ class DirectPreferenceRayTrainer(BaseRayDiffusionTrainer):
         actor_output = self.actor_rollout_wg.update_actor(batch_td)
         actor_output = tu.get(actor_output, "metrics")
         actor_output = rename_dict(actor_output, "actor/")
+        self._assert_campaign_worker_updates(actor_output)
         if (actor_mfu := actor_output.pop("actor/mfu", None)) is not None:
             actor_output["perf/mfu/actor"] = actor_mfu
         return DataProto.from_single_dict(data={}, meta_info={"metrics": actor_output})
+
+    def _audit_art_update_windows(self, batch: DataProto) -> None:
+        """Record the actual global row order before the two distributed updates."""
+        log_dir = self.config.algorithm.get("art_sample_log_dir", None)
+        if not log_dir:
+            return
+        n = int(self.config.actor_rollout_ref.rollout.n)
+        window_size = int(self.config.actor_rollout_ref.actor.ppo_mini_batch_size) * n
+        uid = [str(value) for value in batch.non_tensor_batch["uid"]]
+        if len(uid) != 2 * window_size:
+            raise RuntimeError(f"ART expected two complete {window_size}-trajectory windows, got {len(uid)} rows.")
+        world_size = int(self.config.trainer.n_gpus_per_node) * int(self.config.trainer.nnodes)
+        sp_size = int(self.config.actor_rollout_ref.actor.fsdp_config.ulysses_sequence_parallel_size)
+        if world_size % sp_size:
+            raise RuntimeError(f"ART world size {world_size} is not divisible by actor SP size {sp_size}.")
+        dp_size = world_size // sp_size
+        if len(uid) % dp_size or window_size % dp_size:
+            raise RuntimeError(f"ART {len(uid)} rows and {window_size}-row update cannot split evenly over DP={dp_size}.")
+        local_size = len(uid) // dp_size
+        local_update = window_size // dp_size
+        global_counts = Counter(uid)
+        expected_prompts = int(self.config.data.train_batch_size)
+        if len(global_counts) != expected_prompts or any(count != n for count in global_counts.values()):
+            raise RuntimeError(
+                f"ART rollout must contain {expected_prompts} distinct prompts with {n} trajectories each, "
+                f"got {dict(global_counts)}."
+            )
+        sample_ids = batch.non_tensor_batch.get("_rollout_seed_global_idx", None)
+        if sample_ids is not None:
+            sample_ids = [int(value) for value in sample_ids]
+            if sorted(sample_ids) != list(range(len(uid))):
+                raise RuntimeError("ART update windows contain repeated or missing rollout sample identities.")
+        windows = []
+        for update in range(2):
+            # Pinned verl dispatch uses contiguous BatchData.chunk(dp_size).
+            # Each rank's unshuffled iterator takes its first/second local
+            # mini batch at the corresponding global optimizer update.
+            rows = [
+                index
+                for rank in range(dp_size)
+                for index in range(rank * local_size + update * local_update,
+                                   rank * local_size + (update + 1) * local_update)
+            ]
+            counts = Counter(uid[index] for index in rows)
+            windows.append(
+                {
+                    "unique_prompts": len(counts),
+                    "prompt_counts": dict(sorted(counts.items())),
+                    "sample_ids": [sample_ids[index] for index in rows] if sample_ids is not None else None,
+                }
+            )
+        if self.config.algorithm.get("art_prompt_balanced_split", False):
+            expected = n // 2
+            all_prompts = set(uid)
+            if any(set(window["prompt_counts"]) != all_prompts for window in windows) or any(
+                count != expected for window in windows for count in window["prompt_counts"].values()
+            ):
+                raise RuntimeError("ART A1 window must contain half of every prompt's complete rollout group.")
+        os.makedirs(log_dir, exist_ok=True)
+        final_path = os.path.join(log_dir, f"window_audit_step_{self.global_steps}.json")
+        temporary_path = final_path + ".tmp"
+        with open(temporary_path, "w") as file:
+            json.dump(
+                {"rollout": self.global_steps, "window_size": window_size, "dp_size": dp_size,
+                 "per_rank_update_size": local_update, "dispatch": "contiguous_rank_chunk", "windows": windows},
+                file, sort_keys=True,
+            )
+        os.replace(temporary_path, final_path)
 
     def _compute_ref_noise_pred(self, batch: DataProto) -> Optional[DataProto]:
         """Reference transformer output and shared flow tensors."""
@@ -1814,12 +2067,15 @@ class DirectPreferenceRayTrainer(BaseRayDiffusionTrainer):
             default_backend=self.config.trainer.logger,
             config=OmegaConf.to_container(self.config, resolve=True),
         )
+        self._start_campaign_clock()
 
         self.global_steps = 0
 
         # load checkpoint and update weights before doing anything
         self._load_checkpoint()
-        if self._has_old_adapter:
+        # The actor checkpoint contains both policy-state adapters. Resetting
+        # old on resume would silently discard OmniNFT's EMA policy history.
+        if self._has_old_adapter and self.global_steps == 0:
             self.actor_rollout_wg.copy_adapter(source="default", target="old")
         self.checkpoint_manager.update_weights(self.global_steps)
 
@@ -1827,7 +2083,10 @@ class DirectPreferenceRayTrainer(BaseRayDiffusionTrainer):
 
         # perform validation before training
         # currently, we only support validation using the reward_function.
-        if self.config.trainer.get("val_before_train", True):
+        if self.config.trainer.get("val_before_train", True) and not (
+            self.global_steps > 0
+            and self.config.trainer.get("expected_optimizer_updates_per_rollout", None) is not None
+        ):
             val_metrics = self._validate()
             assert val_metrics, f"{val_metrics=}"
             pprint(f"Initial validation metrics: {val_metrics}")
@@ -1859,6 +2118,7 @@ class DirectPreferenceRayTrainer(BaseRayDiffusionTrainer):
                     self.actor_rollout_wg.async_calls_finalize_fn_exec(blocking=False)
                 metrics = {}
                 timing_raw = {}
+                self._campaign_checkpoint_pending = False
 
                 with marked_timer("start_profile", timing_raw):
                     self._start_profiling(
@@ -1945,7 +2205,9 @@ class DirectPreferenceRayTrainer(BaseRayDiffusionTrainer):
                                 batch.non_tensor_batch.update(
                                     {k: np.array(v) for k, v in reward_extra_infos_dict.items()}
                                 )
+                            metrics.update(self._campaign_weighted_reward_metrics(batch))
                             batch = self._prepare_actor_batch(batch, reward_tensor)
+                            metrics.update(self._campaign_omninft_reward_prob_metrics(batch))
 
                         batch.batch["sample_level_rewards"] = batch.batch["sample_level_scores"]
                         if self.use_reference_policy:
@@ -1978,8 +2240,11 @@ class DirectPreferenceRayTrainer(BaseRayDiffusionTrainer):
                     ):
                         if esi_close_to_expiration:
                             print("Force saving checkpoint: ESI instance expiration approaching.")
-                        with marked_timer("save_checkpoint", timing_raw, color="green"):
-                            self._save_checkpoint()
+                        if self.config.trainer.get("expected_optimizer_updates_per_rollout", None) is not None:
+                            self._campaign_checkpoint_pending = True
+                        else:
+                            with marked_timer("save_checkpoint", timing_raw, color="green"):
+                                self._save_checkpoint()
 
                     # update weights from trainer to rollout
                     with marked_timer("update_weights", timing_raw, color="red"):
@@ -2043,12 +2308,22 @@ class DirectPreferenceRayTrainer(BaseRayDiffusionTrainer):
                 )
                 metrics.update(compute_timing_metrics_diffusion(timing_raw=timing_raw, num_images=num_images))
                 metrics.update(compute_throughput_metrics_diffusion(batch=batch, timing_raw=timing_raw, n_gpus=n_gpus))
+                metrics.update(compute_reward_extra_metrics_diffusion(reward_extra_infos_dict))
+                self._record_campaign_progress(metrics, timing_raw, n_gpus, num_images)
                 gradient_norm = metrics.get("actor/grad_norm", None)
                 if "advantages" in batch.batch:
                     metrics.update(compute_variance_proxy_metrics(batch=batch, gradient_norm=gradient_norm))
                 self._nonfinite_grad_streak = track_nonfinite_grad_streak(self._nonfinite_grad_streak, gradient_norm)
                 metrics["train/nonfinite_grad_steps"] = self._nonfinite_grad_streak
 
+                if self._campaign_checkpoint_pending:
+                    with marked_timer("save_checkpoint", timing_raw, color="green"):
+                        self._save_checkpoint()
+                    metrics["timing_s/save_checkpoint"] = timing_raw["save_checkpoint"]
+                    metrics["cost/end_to_end_gpu_hours"] = (
+                        self._campaign_prior_end_to_end_gpu_seconds
+                        + n_gpus * (time.monotonic() - self._campaign_fit_start)
+                    ) / 3600.0
                 logger.log(data=metrics, step=self.global_steps)
 
                 progress_bar.update(1)

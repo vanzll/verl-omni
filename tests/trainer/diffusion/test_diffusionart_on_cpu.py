@@ -206,6 +206,53 @@ def test_through_the_worker_loss_entry_point_divides_by_gradient_accumulation():
     assert "actor/mask_frac" in metrics
 
 
+def test_art_micro_batch_partitions_preserve_full_update_in_fp32():
+    """Exercise the worker loss divisor across samples and ODE positions."""
+    generator = torch.Generator().manual_seed(42)
+    features = torch.randn(8, 6, 4, generator=generator)
+    old = torch.randn(8, 6, 4, generator=generator) * 0.1
+    guidance = torch.randn(8, 6, 4, generator=generator)
+    next_sigma = torch.tensor([0.7, 0.5, 0.3])
+    sigma = next_sigma + 0.1
+    config = make_actor(art_mask_threshold=1000.0)
+
+    def one_update(micro_size):
+        parameter = torch.nn.Parameter(torch.tensor(0.2))
+        optimizer = torch.optim.SGD([parameter], lr=0.03)
+        optimizer.zero_grad()
+        n_micro = 8 // micro_size
+        total_loss = 0.0
+        for start in range(0, 8, micro_size):
+            rows = slice(start, start + micro_size)
+            for step in range(3):
+                model_output = {
+                    "forward_prediction": old[rows] + parameter * features[rows],
+                    "old_prediction": old[rows],
+                    "t_expanded": sigma[step].expand(micro_size, 1, 1),
+                }
+                data = TensorDict(
+                    {
+                        "art_guidance": guidance[rows],
+                        "sigma_next": next_sigma[step].expand(micro_size),
+                        "video_seq_len": torch.full((micro_size,), 3, dtype=torch.long),
+                    },
+                    batch_size=[micro_size],
+                )
+                tu.assign_non_tensor(data, gradient_accumulation_steps=n_micro * 3, sp_size=1)
+                loss, _ = diffusion_loss(config, model_output, data)
+                total_loss += loss.detach()
+                loss.backward()
+        gradient = parameter.grad.detach().clone()
+        optimizer.step()
+        return total_loss, gradient, parameter.detach().clone()
+
+    full = one_update(8)
+    for micro_size in (4, 2):
+        partitioned = one_update(micro_size)
+        for expected, observed in zip(full, partitioned):
+            torch.testing.assert_close(observed, expected, rtol=1e-5, atol=1e-7)
+
+
 @pytest.mark.parametrize(
     "kwargs, match",
     [
@@ -265,8 +312,15 @@ def make_config(**algorithm_kwargs):
     for key, value in algorithm_kwargs.items():
         setattr(algorithm, key, value)
     algorithm.get = lambda key, default=None: getattr(algorithm, key, default)
-    actor = SimpleNamespace(data_loader_seed=42)
-    return SimpleNamespace(algorithm=algorithm, actor_rollout_ref=SimpleNamespace(actor=actor), reward=reward)
+    actor = SimpleNamespace(
+        data_loader_seed=42, fsdp_config=SimpleNamespace(ulysses_sequence_parallel_size=1)
+    )
+    return SimpleNamespace(
+        algorithm=algorithm,
+        actor_rollout_ref=SimpleNamespace(actor=actor, rollout=SimpleNamespace(n=8)),
+        reward=reward,
+        trainer=SimpleNamespace(n_gpus_per_node=8, nnodes=2),
+    )
 
 
 def test_prepare_actor_batch_writes_cached_states_and_shared_guidance():
@@ -415,6 +469,104 @@ def test_prepare_actor_batch_routes_rewards_per_modality_for_audio_video_latents
     torch.testing.assert_close(result.batch["train_latents"].sort(dim=1).values, all_latents.sort(dim=1).values)
     assert result.batch["train_latents_next"].shape == (6, 4, 8, 2)
     assert "all_next_latents" not in result.batch.keys() and "all_latents" not in result.batch.keys()
+
+
+def test_prompt_balanced_batch_keeps_full_group_guidance_and_audits_windows(tmp_path):
+    uid = [str(prompt) for prompt in range(32) for _ in range(8)]
+    rewards = torch.linspace(-1.0, 1.0, len(uid))
+    original = DiffusionARTLoss.prepare_actor_batch(make_rollout_batch(uid), rewards, make_config())
+    balanced = DiffusionARTLoss.prepare_actor_batch(
+        make_rollout_batch(uid),
+        rewards,
+        make_config(art_prompt_balanced_split=True, art_sample_log_dir=str(tmp_path)),
+    )
+    for prompt in set(uid):
+        original_row = np.flatnonzero(original.non_tensor_batch["uid"] == prompt)[0]
+        balanced_row = np.flatnonzero(balanced.non_tensor_batch["uid"] == prompt)[0]
+        torch.testing.assert_close(
+            original.batch["art_guidance"][original_row], balanced.batch["art_guidance"][balanced_row]
+        )
+    assert sorted(balanced.non_tensor_batch["uid"].tolist()) == sorted(uid)
+    rank_uids = balanced.non_tensor_batch["uid"].reshape(16, 16)
+    for window in (rank_uids[:, :8].reshape(-1), rank_uids[:, 8:].reshape(-1)):
+        counts = np.unique(window, return_counts=True)[1]
+        np.testing.assert_array_equal(counts, np.full(32, 4))
+    # The original sample order is logged with the chosen update window before reordering.
+    record_path = next(tmp_path.glob("step_*.jsonl"))
+    records = [json.loads(line) for line in record_path.read_text().splitlines()]
+    for window in (0.0, 1.0):
+        selected = [row for row in records if row["update_window"] == window]
+        assert len(selected) == 128
+        counts = np.unique([row["uid"] for row in selected], return_counts=True)[1]
+        np.testing.assert_array_equal(counts, np.full(32, 4))
+
+
+def test_joint_routing_uses_one_shared_component_and_covariance_is_linear():
+    uid = ["a", "a", "a", "b", "b", "b"]
+    batch = make_av_rollout_batch(uid)
+    routing = {"video": {"video_align": 1.0, "desync": 1.0}, "audio": {"clap": 1.0, "desync": 1.0}}
+    config = make_config(art_modality_reward_weights=routing, art_joint_reward_routing=True)
+    routed, (components, names) = DiffusionARTLoss._modality_rewards(
+        batch, torch.zeros(6), config, ["video", "audio"]
+    )
+    weights = torch.tensor([{"clap": 1.0, "desync": 1.0, "video_align": 1.0}[name] for name in names])
+    joint = components @ weights
+    torch.testing.assert_close(routed["video"], joint)
+    torch.testing.assert_close(routed["audio"], joint)
+    assert not joint.requires_grad
+    endpoints = batch.batch["all_next_latents"][:, -1]
+    for latent in (endpoints[:, :5], endpoints[:, 5:]):
+        for rows in (slice(0, 3), slice(3, 6)):
+            x = latent[rows].flatten(1)
+            c = components[rows]
+            observed = ((joint[rows] - joint[rows].mean())[:, None] * x).mean(0)
+            expected = sum(
+                weights[i] * ((c[:, i] - c[:, i].mean())[:, None] * x).mean(0)
+                for i in range(len(names))
+            )
+            torch.testing.assert_close(observed, expected)
+    default = DiffusionARTLoss.prepare_actor_batch(make_av_rollout_batch(uid), torch.zeros(6), make_config(art_modality_reward_weights=routing))
+    explicit_off = DiffusionARTLoss.prepare_actor_batch(
+        make_av_rollout_batch(uid), torch.zeros(6), make_config(art_modality_reward_weights=routing, art_joint_reward_routing=False)
+    )
+    torch.testing.assert_close(default.batch["art_guidance"], explicit_off.batch["art_guidance"])
+    constant = make_av_rollout_batch(uid)
+    for name in names:
+        constant.non_tensor_batch[f"reward/{name}"][:] = 1.0
+    inactive = DiffusionARTLoss.prepare_actor_batch(constant, torch.zeros(6), config)
+    assert torch.count_nonzero(inactive.batch["art_guidance"]) == 0
+
+
+def test_cross_covariance_probe_uses_once_counted_shared_reward():
+    batch = make_av_rollout_batch(["a", "a", "a", "b", "b", "b"])
+    endpoints = batch.batch["all_next_latents"][:, -1]
+    names = ["clap", "desync", "video_align"]
+    scores = torch.stack([torch.as_tensor(batch.non_tensor_batch[f"reward/{name}"]) for name in names], dim=1)
+    routing = {
+        "clap": {"routing_weights": {"video": 0.0, "audio": 1.0}},
+        "desync": {"routing_weights": {"video": 1.0, "audio": 1.0}},
+        "video_align": {"routing_weights": {"video": 1.0, "audio": 0.0}},
+    }
+    metrics = DiffusionARTLoss._cross_covariance_probe(
+        endpoints,
+        [("video", slice(0, 5)), ("audio", slice(5, 8))],
+        torch.tensor([0, 0, 0, 1, 1, 1]),
+        (scores, names),
+        routing,
+    )
+    assert metrics["cov_probe/video/groups"] == 2
+    assert metrics["cov_probe/audio/groups"] == 2
+    for modality, latent_slice in (("video", slice(0, 5)), ("audio", slice(5, 8))):
+        observed = metrics[f"cov_probe/{modality}/joint_rms"]
+        expected = []
+        for rows in (slice(0, 3), slice(3, 6)):
+            # Shared DeSync is included once in the joint reward.
+            reward = scores[rows].sum(dim=1)
+            latent = endpoints[rows, latent_slice].flatten(1)
+            covariance = ((reward - reward.mean())[:, None] * latent).mean(dim=0)
+            expected.append(covariance.square().mean().sqrt())
+        torch.testing.assert_close(observed, torch.stack(expected).mean())
+        assert torch.isfinite(metrics[f"cov_probe/{modality}/same_cross_cosine"])
 
 
 OMNINFT_REWARD_METRIC_SUFFIXES = ("mean", "std", "min", "max")

@@ -116,3 +116,67 @@ def test_default_adapter_keeps_nft_forward_and_loss_inputs(monkeypatch, algorith
     assert engine.module.weights["reference"].grad is None
     assert output["loss"] == pytest.approx(loss.item())
     engine._set_adapter.assert_called_once_with("default")
+
+
+def test_omni_nft_engine_keeps_modalities_and_policy_gradients_separate(monkeypatch):
+    class Adapter(DiffusionModelBase):
+        @classmethod
+        def forward(cls, module, model_config, model_inputs, negative_model_inputs=None):
+            return module(**model_inputs)
+
+    class Policies(_Policies):
+        def forward(self, video, audio):
+            weight = self.weights[self.active]
+            return video * weight, audio * weight
+
+    monkeypatch.setitem(DiffusionModelBase._registry, ("_OmniNFTTest", "omni_nft"), Adapter)
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda: 1)
+    monkeypatch.setattr(diffusers_impl.DiffusersFSDPEngine, "_init_device_mesh", lambda self: None)
+    model_config = SimpleNamespace(architecture="_OmniNFTTest", algorithm="omni_nft", external_lib=None, lora_rank=0)
+    engine_config = SimpleNamespace(
+        strategy="fsdp2", full_determinism=False, param_offload=False, optimizer_offload=False, forward_only=False
+    )
+    engine = diffusers_impl.OmniNFTDiffusersFSDPEngine(model_config, engine_config, None, None)
+    engine.scheduler = SimpleNamespace(config=SimpleNamespace(num_train_timesteps=1000))
+    engine.use_ulysses_sp = False
+    engine.module = Policies()
+    engine.use_adapter = lambda name: engine.module.select("old" if name == "old" else "current")
+    engine.disable_adapter = lambda: engine.module.select("reference")
+    engine._set_adapter = Mock()
+    engine.get_data_parallel_group = lambda: None
+    engine._prepare_conditioned_inputs = lambda micro_batch, latents, timestep, step: (
+        {"video": latents[:, :2], "audio": latents[:, 2:]}, None
+    )
+    batch = TensorDict(
+        {
+            "video_latents_clean": torch.full((2, 2, 4), 2.0),
+            "audio_latents_clean": torch.full((2, 3, 4), 4.0),
+            "video_forward_noise": torch.zeros(2, 2, 2, 4),
+            "audio_forward_noise": torch.ones(2, 2, 3, 4),
+            "train_timesteps": torch.full((2, 2), 500.0),
+            "reward_prob": torch.tensor([[[0.2, 0.8], [0.3, 0.7]], [[0.4, 0.6], [0.5, 0.5]]]),
+        },
+        batch_size=[2],
+    )
+    tu.assign_non_tensor(batch, gradient_accumulation_steps=2, sp_size=1)
+
+    def loss_function(*, model_output, data, dp_group):
+        torch.testing.assert_close(data["reward_prob"], batch["reward_prob"][:, 1])
+        torch.testing.assert_close(model_output["video_old_prediction"], model_output["video_xt"])
+        torch.testing.assert_close(model_output["audio_old_prediction"], model_output["audio_xt"])
+        torch.testing.assert_close(model_output["video_ref_forward_prediction"], model_output["video_xt"] * 3)
+        torch.testing.assert_close(model_output["audio_ref_forward_prediction"], model_output["audio_xt"] * 3)
+        assert not model_output["video_old_prediction"].requires_grad
+        assert not model_output["audio_ref_forward_prediction"].requires_grad
+        return (
+            model_output["video_forward_prediction"].square().mean()
+            + model_output["audio_forward_prediction"].square().mean(),
+            {},
+        )
+
+    loss, _ = engine.forward_step(batch, loss_function, False, step=1)
+    loss.backward()
+    assert engine.module.weights["current"].grad.item() > 0
+    assert engine.module.weights["old"].grad is None
+    assert engine.module.weights["reference"].grad is None
+    engine._set_adapter.assert_called_once_with("default")

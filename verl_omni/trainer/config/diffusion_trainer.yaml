@@ -102,6 +102,12 @@ algorithm:
   # DiffusionART-Pairwise: replace scalar rewards by random disjoint-pair win/lose labels in the guidance covariance
   art_pairwise_reward: false
 
+  # ART A1: split every complete prompt group equally across the two optimizer updates
+  art_prompt_balanced_split: false
+
+  # ART A2: route each preprocessed reward component once to both modalities
+  art_joint_reward_routing: false
+
   # DiffusionART: drop the last ODE position from the trainable state pool (the paper's recipes do)
   art_exclude_final_step: true
 
