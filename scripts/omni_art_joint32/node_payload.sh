@@ -29,6 +29,8 @@ export TMPDIR="$RAY_TMPDIR"
 # would reject spilling even with hundreds of GiB available to this campaign.
 export RAY_local_fs_capacity_threshold=1.0
 mkdir -p "$OUTPUT_DIR/logs" "$RAY_TMPDIR" "$TMPDIR"
+timeout --foreground 30 python "$control/transport.py" topology \
+    > "$OUTPUT_DIR/logs/transport_topology_$(hostname -s).json"
 status_file="$OUTPUT_DIR/allocation.status"
 ray_log="$OUTPUT_DIR/logs/ray_$(hostname -s).log"
 spill_dir="$campaign/tmp/ray_spill/$OMNI_ATTEMPT/$(hostname -s)"

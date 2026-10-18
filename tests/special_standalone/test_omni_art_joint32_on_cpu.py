@@ -226,7 +226,13 @@ class LaunchTests(unittest.TestCase):
                 root = Path(directory)
                 (root / "bin").mkdir()
                 shim = root / "bash_env"
-                shim.write_text('source() { case "$1" in */my_bashrc.sh|*/runtime_env.sh|*/use_source_snapshot.sh) return 0;; *) builtin source "$@";; esac; }\n')
+                shim.write_text(
+                    'source() { case "$1" in */my_bashrc.sh|*/runtime_env.sh|*/use_source_snapshot.sh) '
+                    'return 0;; *) builtin source "$@";; esac; }\n'
+                    'python() { if [[ "$1" == */transport.py && "$2" == hydra ]]; then '
+                    'echo \'++ray_kwargs.ray_init.runtime_env.env_vars.NCCL_NET="NCCL RDMA Plugin v9"\'; '
+                    'else command python "$@"; fi; }\n'
+                )
                 python = root / "bin/python3"
                 python.write_text("#!" + sys.executable + "\nimport json,os,sys\nopen(os.environ['CAPTURE'],'w').write(json.dumps(sys.argv[1:]))\nsys.exit(17)\n")
                 python.chmod(0o755)

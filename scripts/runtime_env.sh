@@ -26,16 +26,7 @@ export PATH="$campaign/env/bin:$PATH"
 # The first LTX/Inductor compile on shared storage exceeded the 600s default
 # while kernel outputs were advancing. Preserve model/math and permit warmup.
 export VLLM_OMNI_DLO_DP_WAVE_TIMEOUT=3600
-# All four arms share this measured transport workaround. With this allocation,
-# Torch 2.13/cu129/NCCL 2.29.7 default large collectives were pathologically slow.
-# Same 16-rank payload and exact correctness checks: disabling P2P and NVLS
-# together restored both all-gather and all-reduce throughput. See the report
-# in analysis/gpu_transport/. This does not change model or optimizer settings.
-export NCCL_P2P_DISABLE=1
-export NCCL_NVLS_ENABLE=0
-# Actual world16 two-call GPU probe and same-input Adam state replay passed.
-# Replicated FSDP2 and foreach=false are supplied identically by all four wrappers.
-export NCCL_NET=Socket
+source "$(dirname "${BASH_SOURCE[0]}")/nccl_transport_env.sh"
 # Distributed RPC must stay on the allocation network while external HTTP uses
 # the selected proxy. Reapply after each bashrc source in nested launch shells.
 if [[ -n "${OMNI_HEAD_IP:-}" && -n "${OMNI_NODE_IP:-}" && -n "${OMNI_EXPECTED_PEER_IP:-}" ]]; then

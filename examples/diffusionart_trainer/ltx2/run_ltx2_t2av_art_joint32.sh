@@ -8,6 +8,8 @@ control=${OMNI_CONTROL_DIR:?}
 case "${OMNI_UPDATE_MICROBATCH:-4}" in 1|2|4) ;; *) exit 2 ;; esac
 export PATH="$campaign/env/bin:$PATH"
 source "$control/runtime_env.sh"
+transport_overrides=$(python "$control/transport.py" hydra)
+mapfile -t transport_args <<< "$transport_overrides"
 export HF_HOME="$campaign/cache/hf"
 export HF_HUB_CACHE="$HF_HOME/hub"
 export HF_XET_CACHE="$HF_HOME/xet"
@@ -137,4 +139,5 @@ exec bash "$repo/examples/diffusionart_trainer/ltx2/run_ltx2_t2av_art_lora.sh" \
   ++reward.share_rpc_batches=true \
   ++reward.shared_rpc_cache_batches=16 \
   trainer.resume_mode=disable \
-  "${full_args[@]}"
+  "${full_args[@]}" \
+  "${transport_args[@]}"
