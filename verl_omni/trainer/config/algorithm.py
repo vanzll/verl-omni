@@ -46,6 +46,10 @@ class DiffusionAlgoConfig(BaseConfig):
     art_prompt_balanced_split: bool = False
     # Use one weighted component reward for both video and audio covariance directions.
     art_joint_reward_routing: bool = False
+    # One covariance, RMS, trust-region mask and MSE over all endpoint coordinates.
+    art_joint_latent: bool = False
+    # Replay the rollout's pre-CFG conditional velocity as the frozen ART target.
+    art_cached_conditional_velocity: bool = False
     art_exclude_final_step: bool = True
     art_log_rollout_velocity_gap: bool = False
     art_modality_reward_weights: Optional[dict] = None

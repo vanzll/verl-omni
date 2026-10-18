@@ -25,6 +25,7 @@ import time
 import uuid
 from abc import ABC, abstractmethod
 from collections import Counter, defaultdict
+from itertools import count
 from pprint import pprint
 from typing import Any, Literal, Optional
 
@@ -560,7 +561,13 @@ class BaseRayDiffusionTrainer(ABC):
         if self.config.trainer.total_training_steps is not None:
             total_training_steps = self.config.trainer.total_training_steps
 
-        self.total_training_steps = total_training_steps
+        if self.config.trainer.get("run_until_stopped", False):
+            optim = self.config.actor_rollout_ref.actor.optim
+            if optim.get("lr_scheduler_type", "constant") != "constant" or optim.get("lr_warmup_steps_ratio", 0) != 0:
+                raise ValueError("Unbounded training requires constant LR and no horizon-relative warmup.")
+            self.total_training_steps = None
+        else:
+            self.total_training_steps = total_training_steps
         print(f"Total training steps: {self.total_training_steps}")
 
         try:
@@ -570,6 +577,14 @@ class BaseRayDiffusionTrainer(ABC):
                     self.config.actor_rollout_ref.actor.optim.total_training_steps = total_training_steps
         except (KeyError, TypeError, AttributeError, OmegaConf.errors.OmegaConfBaseException) as e:
             raise RuntimeError("Failed to propagate trainer.total_training_steps to actor optimizer config.") from e
+
+    def _training_epochs(self, current_epoch):
+        if self.config.trainer.get("run_until_stopped", False):
+            return count(current_epoch)
+        return range(current_epoch, self.config.trainer.total_epochs)
+
+    def _is_last_training_step(self):
+        return self.total_training_steps is not None and self.global_steps >= self.total_training_steps
 
     def _dump_generations(
         self,
@@ -1571,7 +1586,7 @@ class PolicyGradientRayTrainer(BaseRayDiffusionTrainer):
         )
         next_step_profile = False
 
-        for epoch in range(current_epoch, self.config.trainer.total_epochs):
+        for epoch in self._training_epochs(current_epoch):
             for batch_dict in self.train_dataloader:
                 if hasattr(self.actor_rollout_wg, "async_calls_finalize_fn_exec"):
                     self.actor_rollout_wg.async_calls_finalize_fn_exec(blocking=False)
@@ -1610,7 +1625,7 @@ class PolicyGradientRayTrainer(BaseRayDiffusionTrainer):
                     len(gen_batch_output), dtype=np.int64
                 )
 
-                is_last_step = self.global_steps >= self.total_training_steps
+                is_last_step = self._is_last_training_step()
                 with marked_timer("step", timing_raw):
                     # generate a batch
                     with marked_timer("gen", timing_raw, color="red"):
@@ -2112,7 +2127,7 @@ class DirectPreferenceRayTrainer(BaseRayDiffusionTrainer):
         )
         next_step_profile = False
 
-        for epoch in range(current_epoch, self.config.trainer.total_epochs):
+        for epoch in self._training_epochs(current_epoch):
             for batch_dict in self.train_dataloader:
                 if hasattr(self.actor_rollout_wg, "async_calls_finalize_fn_exec"):
                     self.actor_rollout_wg.async_calls_finalize_fn_exec(blocking=False)
@@ -2133,7 +2148,7 @@ class DirectPreferenceRayTrainer(BaseRayDiffusionTrainer):
                         [str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object
                     )
 
-                is_last_step = self.global_steps >= self.total_training_steps
+                is_last_step = self._is_last_training_step()
                 with marked_timer("step", timing_raw):
                     reward_extra_infos_dict: dict[str, list] = {}
 

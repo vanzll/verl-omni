@@ -108,6 +108,12 @@ algorithm:
   # ART A2: route each preprocessed reward component once to both modalities
   art_joint_reward_routing: false
 
+  # Joint ART: one covariance and loss over all coordinates; use norm_adv_by_std_in_grpo=false
+  art_joint_latent: false
+
+  # Joint ART: require pre-CFG conditional velocities cached explicitly by the rollout
+  art_cached_conditional_velocity: false
+
   # DiffusionART: drop the last ODE position from the trainable state pool (the paper's recipes do)
   art_exclude_final_step: true
 
@@ -161,6 +167,7 @@ trainer:
 
   # Total training steps (can be set explicitly or derived from epochs)
   total_training_steps: null
+  run_until_stopped: false
 
   # Project name for experiment tracking (e.g., wandb)
   project_name: verl_examples

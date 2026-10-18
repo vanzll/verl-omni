@@ -22,7 +22,201 @@ import pytest
 import torch
 from verl.protocol import DataProto
 
-from verl_omni.reward_loop.replica_dispatch import dispatch_reward_groups
+from verl_omni.reward_loop.replica_dispatch import (
+    SharedRewardBatchCache,
+    dispatch_reward_groups,
+    project_reward_data,
+    tensor_payload_inventory,
+)
+
+
+def test_reward_projection_preserves_media_metadata_and_original_training_tensors():
+    import numpy as np
+
+    responses = torch.arange(48, dtype=torch.uint8).reshape(4, 3, 2, 2)
+    cache = torch.arange(4 * 19 * 64, dtype=torch.float32).reshape(4, 19, 64)
+    original = DataProto.from_dict(
+        tensors={"responses": responses, "media_artifact__video": responses,
+                 "all_conditional_velocities": cache, "all_latents": cache.clone(), "prompt_embeds": cache[:, 0]},
+        non_tensors={"uid": np.array(["a", "b", "c", "d"], dtype=object),
+                     "reward_inputs": np.array([{"text": "same"}] * 4, dtype=object)},
+        meta_info={"validate": False, "sampling_rate": 48000},
+    )
+    projected = project_reward_data(original, ["all_conditional_velocities", "all_latents", "prompt_embeds", "missing"])
+    assert set(projected.batch.keys()) == {"responses", "media_artifact__video"}
+    assert projected.non_tensor_batch is original.non_tensor_batch
+    assert projected.meta_info == original.meta_info
+    torch.testing.assert_close(projected.batch["responses"], responses, rtol=0, atol=0)
+    torch.testing.assert_close(original.batch["all_conditional_velocities"], cache, rtol=0, atol=0)
+    torch.testing.assert_close(original.batch["prompt_embeds"], cache[:, 0], rtol=0, atol=0)
+    assert tensor_payload_inventory(original)["all_conditional_velocities"]["logical_bytes"] == cache.numel() * 4
+
+
+@pytest.mark.parametrize("protected", ["responses", "audio", "audio_sample_rate", "media_artifact__video"])
+def test_reward_projection_rejects_media_exclusion(protected):
+    with pytest.raises(ValueError, match="media"):
+        project_reward_data(_data(2), [protected])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("shared", [False, True])
+async def test_projected_profiled_manager_preserves_raw_scores_and_metadata(monkeypatch, tmp_path, shared):
+    import numpy as np
+
+    from verl_omni.reward_loop.reward_loop import OmniRewardLoopManager
+
+    monkeypatch.setenv("OUTPUT_DIR", str(tmp_path))
+    (tmp_path / "logs").mkdir()
+    data = DataProto.from_dict(
+        tensors={"responses": torch.arange(12, dtype=torch.uint8).reshape(3, 4),
+                 "all_latents": torch.ones(3, 19, 64)},
+        non_tensors={"uid": np.array(["a", "b", "c"], dtype=object)},
+    )
+    received = []
+    monkeypatch.setattr("verl_omni.reward_loop.reward_loop.ray.put", lambda chunk: SimpleNamespace(data=chunk))
+
+    async def compute(chunk):
+        chunk = chunk.data if shared else chunk
+        assert "all_latents" not in chunk.batch
+        received.extend(chunk.non_tensor_batch["uid"].tolist())
+        return [{"reward_score": float(value), "reward_extra_info": {"reward/test": float(value)}}
+                for value in chunk.batch["responses"].sum(dim=1)]
+
+    async def lifecycle():
+        return None
+
+    manager = object.__new__(OmniRewardLoopManager)
+    manager.config = SimpleNamespace(reward=SimpleNamespace(
+        reward_functions={"test": {}}, profile_dispatch=True, rpc_excluded_tensor_keys=["all_latents"],
+        share_rpc_batches=shared, shared_rpc_cache_batches=1,
+    ))
+    manager._preserve_reward_components = True
+    manager._score_lock = asyncio.Lock()
+    manager._reward_payload_profiled_phases = {(False, 3)}
+    manager.multi_reward_model_manager = SimpleNamespace(
+        models={"test": object()}, wake_up=lifecycle, sleep=lifecycle,
+    )
+    manager._reward_worker_groups = {"test": [_worker(compute)]}
+    manager._reward_dispatch_batch_sizes = {"test": 2}
+    result = await manager.async_compute_rm_score(data)
+    torch.testing.assert_close(result.batch["rm_scores"][:, 0], data.batch["responses"].sum(dim=1).float())
+    assert result.non_tensor_batch["reward/test"].tolist() == [6.0, 22.0, 38.0]
+    assert received == ["a", "b", "c"]
+    assert "all_latents" in data.batch
+    assert result.meta_info["reward_names"] == ["test"]
+    assert "perf/reward/wake_seconds" in result.meta_info["reward_extra_keys"]
+    assert (tmp_path / "logs/reward_dispatch_profile.jsonl").is_file()
+
+
+@pytest.mark.asyncio
+async def test_profiled_dispatch_keeps_exact_scores_order_and_one_inflight_per_replica():
+    calls = [[], []]
+    diagnostics = {}
+    result = await dispatch_reward_groups(
+        _data(7), {"native": [_recording_worker(records) for records in calls]},
+        {"native": 2}, diagnostics=diagnostics,
+    )
+    assert result == {"native": list(range(7))}
+    replicas = diagnostics["groups"]["native"]["replicas"]
+    assert sum(row["samples"] for row in replicas) == 7
+    assert sum(row["rpcs"] for row in replicas) == 4
+    assert all(row[key] >= 0 for row in replicas for key in
+               ("slice_seconds", "submit_seconds", "rpc_inflight_seconds"))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("size", [0, 1, 7, 32])
+async def test_shared_batches_preserve_every_group_order_and_bound_cache(size):
+    writes = []
+    received = {}
+
+    def put(chunk):
+        reference = SimpleNamespace(data=chunk)
+        writes.append(reference)
+        return reference
+
+    groups = {}
+    for name, replicas in {"va": 8, "hps": 8, "ab": 4, "clap": 4, "ds": 8}.items():
+        async def compute(reference, name=name):
+            received.setdefault(name, []).append(reference)
+            await asyncio.sleep(0.002 if name == "hps" else 0)
+            return _sample_ids(reference.data)
+
+        groups[name] = [_worker(compute) for index in range(replicas)]
+    cache = SharedRewardBatchCache(groups, put, max_cached_batches=1)
+    diagnostics = {}
+    result = await asyncio.wait_for(dispatch_reward_groups(
+        _data(size), groups, dict.fromkeys(groups, 2), diagnostics=diagnostics, batch_cache=cache,
+    ), timeout=5)
+    assert result == {name: list(range(size)) for name in groups}
+    assert len(writes) == (size + 1) // 2
+    assert cache.cache_hits == 4 * len(writes)
+    assert cache.peak_cached_batches <= 1
+    assert not cache.entries
+    for name in received:
+        assert {id(reference) for reference in received[name]} == {id(reference) for reference in writes}
+    assert diagnostics["shared_rpc_batches"]["materializations"] == len(writes)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stop_kind", ["cancel", "rpc_failure", "put_failure"])
+async def test_shared_batch_abort_wakes_waiters_and_drains_accepted_calls(stop_kind):
+    release = asyncio.Event()
+    accepted = []
+    completed = []
+    fail_rpc = asyncio.Event()
+    writes = []
+
+    def put(chunk):
+        if stop_kind == "put_failure" and writes:
+            raise RuntimeError("put failure")
+        reference = SimpleNamespace(data=chunk)
+        writes.append(reference)
+        return reference
+
+    async def compute(reference, fail=False):
+        accepted.append(reference)
+        try:
+            if fail and stop_kind == "rpc_failure":
+                await fail_rpc.wait()
+                raise RuntimeError("rpc failure")
+            await release.wait()
+            return _sample_ids(reference.data)
+        finally:
+            completed.append(reference)
+
+    groups = {"fast": [_worker(lambda reference: compute(reference, True)) for index in range(3)],
+              "slow": [_worker(compute)]}
+    cache = SharedRewardBatchCache(groups, put, max_cached_batches=1)
+    task = asyncio.create_task(dispatch_reward_groups(
+        _data(12), groups, dict.fromkeys(groups, 2), batch_cache=cache,
+    ))
+    for index in range(100):
+        if len(accepted) >= (2 if stop_kind == "put_failure" else 3):
+            break
+        await asyncio.sleep(0.001)
+    assert accepted
+    if stop_kind == "cancel":
+        task.cancel()
+    else:
+        fail_rpc.set()
+    await asyncio.sleep(0.01)
+    assert not task.done()
+    accepted_before_release = len(accepted)
+    release.set()
+    with pytest.raises(asyncio.CancelledError if stop_kind == "cancel" else RuntimeError):
+        await asyncio.wait_for(task, timeout=2)
+    assert len(completed) == len(accepted) == accepted_before_release
+    assert not cache.entries
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("sizes", [{"va": 2}, {"va": 2, "ab": 3}, {"va": None, "ab": None}])
+async def test_shared_batches_reject_incompatible_dispatch_partition(sizes):
+    groups = {"va": [_recording_worker([])], "ab": [_recording_worker([])]}
+    cache = SharedRewardBatchCache(groups, lambda chunk: chunk)
+    with pytest.raises(ValueError, match="equal dynamic"):
+        await dispatch_reward_groups(_data(4), groups, sizes, batch_cache=cache)
 
 
 def _data(size: int) -> DataProto:

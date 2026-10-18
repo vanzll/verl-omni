@@ -107,7 +107,7 @@ def _drop_defaulted_engine_args(engine_args: dict) -> dict:
     """Keep only explicitly-set engine arguments, dropping upstream defaults."""
     global _ENGINE_ARGS_DEFAULTS
     if _ENGINE_ARGS_DEFAULTS is None:
-        defaults = asdict(OmniEngineArgs(model=""))
+        defaults = asdict(OmniEngineArgs(model=os.curdir))
         defaults.update(asdict(OrchestratorArgs()))
         _ENGINE_ARGS_DEFAULTS = defaults
     defaults = _ENGINE_ARGS_DEFAULTS

@@ -56,6 +56,10 @@ class DiffusionLossConfig(BaseConfig):
     art_corrective_mask_enabled: bool = True
     art_video_weight: float = 1.0
     art_audio_weight: float = 1.0
+    # Use one guidance and trust-region mask over the joint latent sequence.
+    art_joint_latent: bool = False
+    # Reuse the positive conditional transformer velocities captured during rollout.
+    art_cached_conditional_velocity: bool = False
     # OmniNFT-only modality weights and reference regularization coefficients.
     video_weight: float = 1.0
     audio_weight: float = 1.0

@@ -1164,9 +1164,7 @@ class OmniNFTLoss(DiffusionNFTLoss):
             "old_deviate": (forward_prediction - old_prediction).square().mean(),
             "reward_prob_mean": reward_weight.mean(),
             "reward_prob_std": reward_weight.float().std(unbiased=False),
-            "reward_prob_saturation_frac": (
-                (reward_weight <= 1e-6) | (reward_weight >= 1.0 - 1e-6)
-            ).float().mean(),
+            "reward_prob_saturation_frac": ((reward_weight <= 1e-6) | (reward_weight >= 1.0 - 1e-6)).float().mean(),
         }
         return policy_loss, ref_loss, details
 
@@ -1703,6 +1701,8 @@ class DiffusionARTLoss(DiffusionLossFn):
     ``video_seq_len``. Guidance, mask and MSE are then computed per modality, each from its own
     reward route (``algorithm.art_modality_reward_weights`` or ``reward_functions.*.routing_weights``)
     and with its own unit RMS, and combined with ``art_video_weight`` / ``art_audio_weight``.
+    Opt-in ``art_joint_latent`` instead uses one deduplicated reward and one guidance, RMS, mask
+    and MSE across the entire sequence. It requires synchronous modality flow times.
     """
 
     uses_old_adapter = True
@@ -1725,6 +1725,13 @@ class DiffusionARTLoss(DiffusionLossFn):
             raise ValueError(f"video_seq_len must be one shared value in (0, {width}), got {values.tolist()}.")
         return [("video", slice(0, split)), ("audio", slice(split, width))]
 
+    @staticmethod
+    def _joint_time(value: torch.Tensor, reference: torch.Tensor, name: str) -> torch.Tensor:
+        """Collapse synchronous segment times, rejecting a different joint flow-time grid."""
+        if not torch.isfinite(value).all() or not torch.equal(value, reference.unsqueeze(-1).expand_as(value)):
+            raise ValueError(f"Joint ART requires synchronous {name} equal to the shared flow times.")
+        return value[..., :1]
+
     @classmethod
     def compute_loss(
         cls,
@@ -1745,25 +1752,40 @@ class DiffusionARTLoss(DiffusionLossFn):
 
         Masked and inactive items contribute zero but stay in the denominator, as in the paper's
         ``1/|B|`` average. With ``video_seq_len`` the loss is the ``art_video_weight`` /
-        ``art_audio_weight`` average of the two modality losses. ``rollout_velocity`` (the Euler
+        ``art_audio_weight`` average of the two modality losses unless ``art_joint_latent`` is enabled,
+        in which case every coordinate participates in a single mask and MSE. ``rollout_velocity`` (the Euler
         velocity implied by consecutive rollout states) is only used for the ``old_rollout_gap`` metric.
         ``segment_sigma`` / ``segment_sigma_next`` ``(B, n_segments)`` give each modality its own flow
         time when a pipeline denoises the modalities on different sigma grids (the pipeline adapter
         supplies them); without them every segment uses ``t_expanded`` / ``sigma_next``.
         """
         loss_cfg = config.diffusion_loss
+        joint = bool(getattr(loss_cfg, "art_joint_latent", False))
         sigma = t_expanded.reshape(t_expanded.shape[0], -1)[:, 0]
+        if joint:
+            cls._joint_time(t_expanded.reshape(sigma.shape[0], -1), sigma, "t_expanded")
         segments = cls._segments(forward_prediction.shape[1], video_seq_len)
         for name, value in (("segment_sigma", segment_sigma), ("segment_sigma_next", segment_sigma_next)):
-            if value is not None and tuple(value.shape) != (sigma.shape[0], len(segments)):
+            valid_shapes = {(sigma.shape[0], len(segments))}
+            if joint:
+                valid_shapes.add((sigma.shape[0], 1))
+            if value is not None and tuple(value.shape) not in valid_shapes:
                 raise ValueError(
                     f"{name} must have shape (batch, {len(segments)}) for {len(segments)} segment(s), "
                     f"got {tuple(value.shape)}."
                 )
         if (segment_sigma is None) != (segment_sigma_next is None):
             raise ValueError("segment_sigma and segment_sigma_next must be given together.")
+        if joint:
+            if segment_sigma is not None:
+                segment_sigma = cls._joint_time(segment_sigma, sigma, "segment_sigma")
+                segment_sigma_next = cls._joint_time(segment_sigma_next, sigma_next.reshape(-1), "segment_sigma_next")
+            segments = [("newjoint", slice(0, forward_prediction.shape[1]))]
+            if art_anchor is not None and art_anchor.ndim != 1 and art_anchor.shape[1] != 1:
+                raise ValueError("Joint ART requires one anchor flag per sample, not per modality.")
         segment_weights = {
             "": 1.0,
+            "newjoint": 1.0,
             "video": float(loss_cfg.art_video_weight),
             "audio": float(loss_cfg.art_audio_weight),
         }
@@ -1964,8 +1986,10 @@ class DiffusionARTLoss(DiffusionLossFn):
 
         The rollout policy must be the exact old policy (hard-copied ``old`` adapter, no EMA), each
         visited state is used once per rollout (``ppo_epochs=1``), the guidance is a per-prompt
-        covariance (``rollout.n >= 2``), the rollout is an ODE, ``v_old`` is recomputed by the
-        training forward, so the training-side CFG must equal the rollout CFG, and the per-rank mini
+        covariance (``rollout.n >= 2``), and the rollout is an ODE. By default ``v_old`` is recomputed
+        by the training forward, so training-side CFG must equal rollout CFG. Cached conditional mode
+        instead requires neutral model guidance and explicit, matching cache switches at all three
+        boundaries; rollout CFG may differ. The per-rank mini
         batch (``ppo_mini_batch_size * n / dp`` samples) must be divisible by
         ``ppo_micro_batch_size_per_gpu``, which the engine otherwise asserts only after the first rollout.
         The paper's two-update restoration follows from ``ppo_mini_batch_size`` splitting the rollout batch
@@ -1977,6 +2001,15 @@ class DiffusionARTLoss(DiffusionLossFn):
         model_cfg = config.actor_rollout_ref.model
         rollout_cfg = config.actor_rollout_ref.rollout
         problems = []
+        joint = bool(algorithm_cfg.get("art_joint_latent", False))
+        cached = bool(algorithm_cfg.get("art_cached_conditional_velocity", False))
+        for key in ("art_joint_latent", "art_cached_conditional_velocity"):
+            expected = bool(algorithm_cfg.get(key, False))
+            for path in (f"actor.diffusion_loss.{key}", f"rollout.algo.{key}"):
+                if bool(OmegaConf.select(config.actor_rollout_ref, path, default=False)) != expected:
+                    problems.append(f"algorithm.{key} must equal actor_rollout_ref.{path}")
+        if joint and algorithm_cfg.get("norm_adv_by_std_in_grpo", True):
+            problems.append("joint ART requires algorithm.norm_adv_by_std_in_grpo=False (keep raw reward ratios)")
         if not int(model_cfg.get("lora_rank", 0) or 0) > 0:
             problems.append("actor_rollout_ref.model.lora_rank must be > 0 (DiffusionART trains LoRA adapters)")
         if "old" not in tuple(model_cfg.get("policy_state_adapters", ("default",))):
@@ -2017,15 +2050,25 @@ class DiffusionARTLoss(DiffusionLossFn):
                 problems.append("art_prompt_balanced_split needs exactly two optimizer mini batches per rollout")
             if actor_cfg.get("shuffle", False):
                 problems.append("art_prompt_balanced_split needs actor.shuffle=False to preserve its two windows")
-        if algorithm_cfg.get("art_prompt_balanced_split", False) and algorithm_cfg.get("art_joint_reward_routing", False):
+        if (
+            not joint
+            and algorithm_cfg.get("art_prompt_balanced_split", False)
+            and algorithm_cfg.get("art_joint_reward_routing", False)
+        ):
             problems.append("art_prompt_balanced_split and art_joint_reward_routing are separate ablations")
         if algorithm_cfg.get("art_pairwise_reward", False) and (
-            algorithm_cfg.get("art_prompt_balanced_split", False) or algorithm_cfg.get("art_joint_reward_routing", False)
+            joint
+            or algorithm_cfg.get("art_prompt_balanced_split", False)
+            or algorithm_cfg.get("art_joint_reward_routing", False)
         ):
             problems.append("art_prompt_balanced_split and art_joint_reward_routing require scalar rewards")
         for key in ("guidance_scale", "true_cfg_scale", "video_cfg_scale", "audio_cfg_scale"):
             model_value = OmegaConf.select(config, f"actor_rollout_ref.model.pipeline.{key}", default=None)
             rollout_value = OmegaConf.select(config, f"actor_rollout_ref.rollout.pipeline.{key}", default=None)
+            if cached:
+                if model_value is not None and float(model_value) != 1.0:
+                    problems.append(f"actor_rollout_ref.model.pipeline.{key}={model_value} must be 1.0 for cached ART")
+                continue
             if model_value is None and rollout_value is None:
                 continue
             if float(model_value if model_value is not None else 1.0) != float(
@@ -2046,6 +2089,12 @@ class DiffusionARTLoss(DiffusionLossFn):
             ("video_rescale_scale", 0.0),
             ("audio_rescale_scale", 0.0),
         ):
+            if cached:
+                model_value = OmegaConf.select(config, f"actor_rollout_ref.model.pipeline.{key}", default=None)
+                if model_value is not None and float(model_value) != neutral:
+                    problems.append(
+                        f"actor_rollout_ref.model.pipeline.{key}={model_value} must be {neutral} for cached ART"
+                    )
             value = OmegaConf.select(config, f"actor_rollout_ref.rollout.pipeline.{key}", default=None)
             if value is not None and float(value) != neutral:
                 problems.append(
@@ -2197,12 +2246,16 @@ class DiffusionARTLoss(DiffusionLossFn):
         Returns the routed reward per modality and, when components were routed, the standardised component
         matrix ``(B, K)`` with its names (for the per-sample records).
 
-        Components are centred per prompt and scaled like DiffusionNFT advantages
+        Components are centred per prompt and, in legacy mode, scaled like DiffusionNFT advantages
         (``algorithm.norm_adv_by_std_in_grpo`` / ``global_std``) before the weighted sum, so routing
         weights act on comparable scales; the guidance itself is invariant to per-prompt affine reward
-        changes, so only the relative component scales matter.
+        changes, so only the relative component scales matter. Joint latents require std normalization
+        disabled: raw component ratios and routing weights are preserved, regardless of ``global_std``.
         """
         rewards = reward_tensor.detach().float().cpu()
+        joint = bool(config.algorithm.get("art_joint_latent", False))
+        if joint and config.algorithm.norm_adv_by_std_in_grpo:
+            raise ValueError("joint ART requires algorithm.norm_adv_by_std_in_grpo=False (keep raw reward ratios)")
         if modalities == [""]:
             if config.algorithm.get("art_joint_reward_routing", False):
                 raise ValueError("ART joint reward routing requires video and audio modalities.")
@@ -2240,7 +2293,7 @@ class DiffusionARTLoss(DiffusionLossFn):
             ],
             dim=1,
         )
-        if algorithm_cfg.get("art_joint_reward_routing", False):
+        if joint or algorithm_cfg.get("art_joint_reward_routing", False):
             if set(modalities) != {"video", "audio"}:
                 raise ValueError("ART joint reward routing requires video and audio modalities.")
             joint_weights: dict[str, float] = {}
@@ -2350,7 +2403,9 @@ class DiffusionARTLoss(DiffusionLossFn):
         ``algorithm.art_exclude_final_step``, times ``algorithm.timestep_fraction``, reseeded per rollout
         with ``data_loader_seed + global_steps``), ``art_guidance``
         ``(B, *latent)`` shared by all rows of a prompt (per modality for audio-video latents), the
-        pairwise ``art_anchor`` flags, optionally ``train_latents_next`` for the rollout-velocity
+        pairwise ``art_anchor`` flags, optionally ``train_conditional_velocities`` ``(B, S, L, D)`` gathered
+        with the identical state indices (never inferred from CFG or state differences), ``train_latents_next``
+        for the rollout-velocity
         diagnostic, ``advantages`` / ``returns`` / ``sample_level_rewards`` for logging, and replicated
         whole-rollout scalars (``batch_metric_prefix``) that the loss reports as ``actor/<name>``: OmniNFT's
         ``reward/<name>/{mean,std,min,max}`` and ``reward/sum/{mean,std}`` when raw components are available,
@@ -2373,22 +2428,58 @@ class DiffusionARTLoss(DiffusionLossFn):
             batch_metrics.update(cls.reward_summaries(*components))
         states, next_states, all_timesteps = cls._trajectory(batch)
         batch_size, num_steps = all_timesteps.shape
+        joint = bool(algorithm_cfg.get("art_joint_latent", False))
+        conditional_velocities = None
+        if algorithm_cfg.get("art_cached_conditional_velocity", False):
+            conditional_velocities = batch.batch.get("all_conditional_velocities", None)
+            if conditional_velocities is None:
+                raise ValueError(
+                    "Cached ART requires `all_conditional_velocities` from the rollout; no fallback is allowed."
+                )
+            if conditional_velocities.ndim != 4 or conditional_velocities.shape != states.shape:
+                raise ValueError(
+                    "all_conditional_velocities must have shape (B, T, L, D) matching rollout states, got "
+                    f"{tuple(conditional_velocities.shape)} vs {tuple(states.shape)}."
+                )
+            if not conditional_velocities.is_floating_point() or not torch.isfinite(conditional_velocities).all():
+                raise ValueError(
+                    "all_conditional_velocities must contain finite floating-point conditional predictions."
+                )
         endpoints = next_states[:, -1].float()
         segments = cls._segments(endpoints.shape[1], batch.batch.get("video_seq_len", None))
+        probe_segments = segments
+        segment_timesteps = batch.batch.get("all_segment_timesteps", None)
+        if segment_timesteps is not None:
+            if segment_timesteps.ndim != 3 or segment_timesteps.shape != (*all_timesteps.shape, len(segments)):
+                raise ValueError(
+                    "all_segment_timesteps must have shape (B, T, n_segments) matching all_timesteps, got "
+                    f"{tuple(segment_timesteps.shape)} for {len(segments)} segment(s)."
+                )
+            if joint:
+                segment_timesteps = cls._joint_time(segment_timesteps, all_timesteps, "all_segment_timesteps")
 
         uid = batch.non_tensor_batch["uid"]
         group_index, num_groups = group_index_from_uid(uid)
         modality_rewards, standardized = cls._modality_rewards(
             batch, reward_tensor, config, [name for name, _ in segments]
         )
+        if joint:
+            # Routing deduplicates shared components before this single full-coordinate covariance.
+            reward = modality_rewards[segments[0][0]]
+            if any(not torch.equal(value, reward) for value in modality_rewards.values()):
+                raise ValueError("Joint ART requires one shared reward across all endpoint coordinates.")
+            modality_rewards = {"newjoint": reward}
+            segments = [("newjoint", slice(0, endpoints.shape[1]))]
         probe_step = cls._global_step(batch)
         if standardized is not None and probe_step is not None and (probe_step == 1 or probe_step % 10 == 0):
             batch_metrics.update(
                 cls._cross_covariance_probe(
-                    endpoints, segments, group_index, standardized, config.reward.reward_functions
+                    endpoints, probe_segments, group_index, standardized, config.reward.reward_functions
                 )
             )
         pairwise = bool(algorithm_cfg.get("art_pairwise_reward", False))
+        if joint and pairwise:
+            raise ValueError("Joint ART requires scalar rewards, not art_pairwise_reward.")
         step_seed = cls._step_seed(batch, int(actor_cfg.data_loader_seed))
         balanced_order = None
         balanced_dp_size = None
@@ -2480,22 +2571,14 @@ class DiffusionARTLoss(DiffusionLossFn):
             global_std=algorithm_cfg.global_std,
         )
         batch.batch["train_latents"] = states.gather(1, latent_index)
+        if conditional_velocities is not None:
+            batch.batch["train_conditional_velocities"] = conditional_velocities.detach().gather(1, latent_index)
         if algorithm_cfg.get("art_log_rollout_velocity_gap", False):
             batch.batch["train_latents_next"] = next_states.gather(1, latent_index)
         batch.batch["train_timesteps"] = all_timesteps.gather(1, step_index)
         batch.batch["train_timesteps_next"] = next_timesteps.gather(1, step_index)
-        segment_timesteps = batch.batch.get("all_segment_timesteps", None)
         if segment_timesteps is not None:
             # (B, T, K) per-segment flow times (modalities on different sigma grids); same gather as above.
-            if segment_timesteps.shape[:2] != all_timesteps.shape or segment_timesteps.ndim != 3:
-                raise ValueError(
-                    "all_segment_timesteps must have shape (B, T, n_segments) matching all_timesteps, got "
-                    f"{tuple(segment_timesteps.shape)} vs {tuple(all_timesteps.shape)}."
-                )
-            if segment_timesteps.shape[-1] != len(segments):
-                raise ValueError(
-                    f"all_segment_timesteps has {segment_timesteps.shape[-1]} columns for {len(segments)} segment(s)."
-                )
             segment_next = torch.cat([segment_timesteps[:, 1:], torch.zeros_like(segment_timesteps[:, :1])], dim=1)
             segment_index = step_index.unsqueeze(-1).expand(-1, -1, segment_timesteps.shape[-1])
             batch.batch["train_segment_timesteps"] = segment_timesteps.gather(1, segment_index)
@@ -2507,7 +2590,13 @@ class DiffusionARTLoss(DiffusionLossFn):
         batch.batch["advantages"] = advantages[:, None].expand(-1, num_train)
         batch.batch["returns"] = batch.batch["advantages"]
         batch.batch["sample_level_rewards"] = reward_tensor[:, None].expand(-1, num_train)
-        for key in ("all_latents", "all_next_latents", "all_log_probs", "all_segment_timesteps"):
+        for key in (
+            "all_latents",
+            "all_next_latents",
+            "all_log_probs",
+            "all_segment_timesteps",
+            "all_conditional_velocities",
+        ):
             if key in batch.batch.keys():
                 del batch.batch[key]
         if balanced_order is not None:

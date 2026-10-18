@@ -73,6 +73,35 @@ def _build_selected_workers(bundle_indices, resource_pool, prefix="native_reward
     )
 
 
+def test_reward32_placements_use_every_physical_parent_bundle_once(monkeypatch):
+    resource_pool = _FakeResourcePool()
+    resource_pool.store = [8, 8, 8, 8]
+    resource_pool.get_placement_groups = lambda device_name: ["pg0", "pg1", "pg2", "pg3"]
+    monkeypatch.setattr(worker_module, "get_device_name", lambda: "cuda")
+    monkeypatch.setattr(worker_module, "get_platform", lambda: SimpleNamespace(
+        ray_resource_options=lambda count: {"num_gpus": count}
+    ))
+    monkeypatch.setattr(worker_module, "PlacementGroupSchedulingStrategy",
+                        lambda placement_group, placement_group_bundle_index:
+                        (placement_group, placement_group_bundle_index))
+    assignments = {
+        "video_align": [0, 1, 8, 9, 16, 17, 24, 25],
+        "hpsv3": [2, 3, 10, 11, 18, 19, 26, 27],
+        "audiobox": [4, 12, 20, 28], "clap": [5, 13, 21, 29],
+        "desync": [6, 7, 14, 15, 22, 23, 30, 31],
+    }
+    selected = []
+    for name, devices in assignments.items():
+        indexed_pool = worker_module._IndexedResourcePool(resource_pool, devices)
+        workers = worker_module.build_accelerator_reward_workers(
+            config=_config(len(devices)), reward_loop_workers_class=_FakeActorClass(),
+            accelerator_resource_pool=indexed_pool, worker_name_prefix=name,
+        )
+        selected.extend(worker.options["scheduling_strategy"] for worker in workers)
+    assert len(selected) == len(set(selected)) == 32
+    assert set(selected) == {(f"pg{node}", device) for node in range(4) for device in range(8)}
+
+
 def test_accelerator_reward_workers_use_distinct_resource_pool_bundles(monkeypatch):
     resource_pool = _FakeResourcePool()
     monkeypatch.setattr(worker_module, "get_device_name", lambda: "npu")

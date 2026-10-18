@@ -1418,7 +1418,7 @@ def test_drop_defaulted_engine_args_keeps_only_explicit_overrides():
 
     from vllm_omni.engine.arg_utils import OmniEngineArgs
 
-    defaults = asdict(OmniEngineArgs(model=""))
+    defaults = asdict(OmniEngineArgs(model="."))
     engine_args = dict(defaults)
     engine_args["model"] = "some-model"
     engine_args["tensor_parallel_size"] = 2
@@ -1465,6 +1465,29 @@ def test_drop_defaulted_engine_args_keeps_only_explicit_overrides():
     filtered = server_module._drop_defaulted_engine_args(engine_args)
     assert filtered["diffusers_load_kwargs"] == {"use_safetensors": True}
     assert filtered["reasoning_parser_plugin"] == "openai"
+
+
+def test_defaulted_engine_args_offline_uses_existing_local_identity(monkeypatch, tmp_path):
+    import huggingface_hub.constants
+    import vllm.engine.arg_utils
+
+    calls = []
+
+    def require_local_model(model, revision):
+        from pathlib import Path
+
+        assert model and Path(model).is_dir()
+        calls.append(model)
+        return model
+
+    monkeypatch.setattr(huggingface_hub.constants, "HF_HUB_OFFLINE", True)
+    monkeypatch.setattr(vllm.engine.arg_utils, "get_model_path", require_local_model)
+    monkeypatch.setattr(server_module, "_ENGINE_ARGS_DEFAULTS", None)
+    monkeypatch.chdir(tmp_path)
+    actual_model = str(tmp_path / "actual-model-identity")
+    result = server_module._drop_defaulted_engine_args({"model": actual_model, "tensor_parallel_size": 2})
+    assert calls == ["."]
+    assert result == {"model": actual_model, "tensor_parallel_size": 2}
 
 
 def test_ar_deploy_config_omits_text_encoder_tp_size_on_ar_stages(tmp_path, monkeypatch):

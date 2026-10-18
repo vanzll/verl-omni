@@ -428,6 +428,11 @@ class LTX23PipelineWithLogProb(LTX2Pipeline):
                 "negative_prompt_embeds_mask": prompt_context.negative_connector_attention_mask,
             },
             rl={
+                **{
+                    key: self._flow_grpo_trajectory[key]
+                    for key in ("all_conditional_velocities",)
+                    if key in self._flow_grpo_trajectory
+                },
                 "all_next_latents": self._flow_grpo_trajectory.get("all_next_latents"),
                 "video_seq_len": self._flow_grpo_trajectory.get("video_seq_len"),
                 "condition_image_latents": self._flow_grpo_trajectory.get("condition_image_latents"),

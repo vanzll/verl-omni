@@ -20,6 +20,8 @@ import os
 import warnings
 from abc import ABC, abstractmethod
 from contextlib import nullcontext
+from functools import partial
+from pathlib import Path
 from typing import Callable, Optional
 
 import torch
@@ -76,6 +78,41 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 device_name = get_device_name()
+
+
+def _load_diffusers_pretrained(model_path, *, torch_dtype, trust_remote_code, subfolder):
+    from diffusers import AutoModel
+
+    component_path = Path(model_path) / (subfolder or "") / "config.json"
+    component_config = json.loads(component_path.read_text()) if component_path.is_file() else {}
+    index_path = Path(model_path) / "model_index.json"
+    index_config = json.loads(index_path.read_text()) if index_path.is_file() else {}
+    expected_class = "LTX2VideoTransformer3DModel"
+    indexed_class = index_config.get(subfolder) if subfolder else None
+    use_local_ltx = (
+        not trust_remote_code
+        and "auto_map" not in component_config
+        and "auto_map" not in index_config
+        and component_config.get("_class_name") == expected_class
+        and (indexed_class is None or indexed_class == ["diffusers", expected_class])
+    )
+    if not use_local_ltx:
+        return AutoModel.from_pretrained(
+            model_path, torch_dtype=torch_dtype, trust_remote_code=trust_remote_code, subfolder=subfolder
+        )
+
+    from diffusers import LTX2VideoTransformer3DModel
+    from diffusers.utils import DIFFUSERS_LOAD_ID_FIELDS
+
+    load_kwargs = dict.fromkeys(("cache_dir", "force_download", "local_files_only", "proxies", "revision", "token"))
+    load_kwargs.update(torch_dtype=torch_dtype, subfolder=subfolder)
+    module = LTX2VideoTransformer3DModel.from_pretrained(model_path, **load_kwargs)
+    load_identity = {"pretrained_model_name_or_path": model_path, **load_kwargs}
+    module._diffusers_load_id = "|".join(
+        "null" if load_identity.get(field, "null") is None else str(load_identity.get(field, "null"))
+        for field in DIFFUSERS_LOAD_ID_FIELDS
+    )
+    return module
 
 
 def _cast_loaded_diffusers_module(
@@ -274,7 +311,6 @@ class DiffusersFSDPEngine(LoRAAdapterMixin, BaseEngine, ABC):
         module.enable_gradient_checkpointing()
 
     def _build_module(self):
-        from diffusers import AutoModel
         from verl.utils.torch_dtypes import PrecisionType
 
         torch_dtype = self.engine_config.model_dtype
@@ -295,7 +331,7 @@ class DiffusersFSDPEngine(LoRAAdapterMixin, BaseEngine, ABC):
         with init_context(), warnings.catch_warnings():
             warnings.simplefilter("ignore")
 
-            module = AutoModel.from_pretrained(
+            module = _load_diffusers_pretrained(
                 self.model_config.config_path or self.model_config.local_path,
                 torch_dtype=torch_dtype,
                 trust_remote_code=self.model_config.trust_remote_code,
@@ -1726,9 +1762,56 @@ class ARTDiffusersFSDPEngine(NFTDiffusersFSDPEngine):
 
     Unlike the NFT engine it never re-noises the endpoint. ``train_latents[:, step]`` is the state the
     ODE rollout actually visited at ``train_timesteps[:, step]``; the ``old`` LoRA adapter (the rollout
-    policy) recomputes ``v_old`` there and the ``default`` adapter gives ``v_theta``. No reference
-    forward is run because DiffusionART has no KL term.
+    policy) normally recomputes ``v_old`` there and the ``default`` adapter gives ``v_theta``.
+    Cached conditional mode instead reads ``v_old`` from rollout and forwards only the current
+    positive conditional branch. No reference forward is run because DiffusionART has no KL term.
     """
+
+    def _record_conditional_cache_audit(self, micro_batch, old_prediction, forward_prediction, step):
+        import json
+        import os
+        from pathlib import Path
+
+        if os.environ.get("OMNI_ART_CACHE_ACCEPTANCE") != "1":
+            return
+        count = getattr(self, "_art_cache_audit_count", 0)
+        if count >= 38:
+            return
+
+        def metadata(name):
+            value = micro_batch.get(name, None)
+            if hasattr(value, "tolist"):
+                return value.tolist()
+            return getattr(value, "data", value)
+
+        old = old_prediction.detach().float()
+        current = forward_prediction.detach().float()
+        difference = current - old
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        record = {
+            "rank": rank,
+            "forward_ordinal": count,
+            "selected_step": int(step),
+            "uid": metadata("uid"),
+            "sample_ids": metadata("_rollout_seed_global_idx"),
+            "global_steps": metadata("global_steps"),
+            "timesteps": micro_batch["train_timesteps"][:, step].detach().cpu().tolist(),
+            "cache_shape": list(micro_batch["train_conditional_velocities"].shape),
+            "cache_dtype": str(micro_batch["train_conditional_velocities"].dtype),
+            "video_seq_len": metadata("video_seq_len"),
+            "current_old_mse": difference.square().mean().item(),
+            "current_old_max_abs": difference.abs().max().item(),
+            "old_rms": old.square().mean().sqrt().item(),
+            "current_rms": current.square().mean().sqrt().item(),
+            "current_finite": bool(torch.isfinite(current).all()),
+            "old_finite": bool(torch.isfinite(old).all()),
+            "target_source": "rollout_native_positive_conditional_cache",
+        }
+        directory = Path(os.environ["OUTPUT_DIR"]) / "logs"
+        directory.mkdir(parents=True, exist_ok=True)
+        with (directory / f"cache_acceptance_rank_{rank}.jsonl").open("a") as stream:
+            stream.write(json.dumps(record, default=str) + "\n")
+        self._art_cache_audit_count = count + 1
 
     def prepare_model_inputs(self, micro_batch: TensorDict, step: int):
         xt = micro_batch["train_latents"][:, step]
@@ -1737,6 +1820,41 @@ class ARTDiffusersFSDPEngine(NFTDiffusersFSDPEngine):
         model_inputs, negative_model_inputs = self._prepare_conditioned_inputs(micro_batch, xt, timestep, step)
         return model_inputs, negative_model_inputs, None, xt, t_expanded
 
+    def _prepare_timestep_staging(self, data: TensorDict, timesteps_key: str) -> tuple[dict[str, int], list[str]]:
+        if data.get("train_conditional_velocities", None) is None:
+            return super()._prepare_timestep_staging(data, timesteps_key)
+        timesteps = data[timesteps_key]
+        latents = data["train_latents"]
+        if timesteps.ndim != 2 or latents.ndim != 4 or latents.shape[:2] != timesteps.shape:
+            raise ValueError("Cached ART staging requires aligned (B, T) times and (B, T, L, D) states.")
+        if data["train_conditional_velocities"].shape != latents.shape:
+            raise ValueError("Cached ART staging requires conditional velocities matching train_latents.")
+        step_fields = dict.fromkeys(
+            (
+                "train_latents",
+                "train_latents_next",
+                "train_timesteps",
+                "train_timesteps_next",
+                "train_conditional_velocities",
+                "train_segment_timesteps",
+                "train_segment_timesteps_next",
+            ),
+            1,
+        )
+        step_fields = {key: width for key, width in step_fields.items() if key in data}
+        for key in step_fields:
+            if data[key].shape[:2] != timesteps.shape:
+                raise ValueError(f"Cached ART staging field {key!r} has mismatched batch/timestep dimensions.")
+        for key, value in data.items():
+            if isinstance(value, torch.Tensor) and (value.device.type != "cpu" or value.requires_grad):
+                raise ValueError(f"Timestep staging requires CPU inputs without gradients, got {key!r}.")
+        shared_keys = [key for key in data.keys() if key not in step_fields]
+        # The temporal loop injects these after staging is planned, before selecting shared inputs.
+        for key in ("sp_size", "gradient_accumulation_steps"):
+            if key not in shared_keys:
+                shared_keys.append(key)
+        return step_fields, shared_keys
+
     @staticmethod
     def art_loss_inputs(
         micro_batch: TensorDict,
@@ -1744,6 +1862,8 @@ class ARTDiffusersFSDPEngine(NFTDiffusersFSDPEngine):
         xt: torch.Tensor,
         t_expanded: torch.Tensor,
         num_train_timesteps: int,
+        *,
+        include_rollout_velocity: bool = True,
     ) -> dict[str, torch.Tensor]:
         """Per-step batch tensors for ``DiffusionARTLoss``: ``sigma_next`` plus the optional segment, anchor and
         rollout-velocity inputs.
@@ -1768,7 +1888,7 @@ class ARTDiffusersFSDPEngine(NFTDiffusersFSDPEngine):
         for key in micro_batch.keys():
             if isinstance(key, str) and key.startswith("_art_metric::"):
                 loss_inputs[key] = micro_batch[key]
-        if micro_batch.get("train_latents_next", None) is not None:
+        if include_rollout_velocity and micro_batch.get("train_latents_next", None) is not None:
             sigma = t_expanded.reshape(xt.shape[0], -1)[:, 0]
             step_size = (sigma_next - sigma).view(-1, *([1] * (xt.ndim - 1)))
             loss_inputs["rollout_velocity"] = (
@@ -1786,13 +1906,43 @@ class ARTDiffusersFSDPEngine(NFTDiffusersFSDPEngine):
         }
 
     def forward_step(self, micro_batch: TensorDict, loss_function, forward_only, step):
+        # TrainingWorker binds the actor config in this partial; engines do not own actor configs.
+        actor_config = loss_function.keywords.get("config") if isinstance(loss_function, partial) else None
+        cached = bool(actor_config is not None and actor_config.diffusion_loss.art_cached_conditional_velocity)
+        if cached:
+            cache = micro_batch.get("train_conditional_velocities", None)
+            latents = micro_batch["train_latents"]
+            if not isinstance(cache, torch.Tensor):
+                raise ValueError("Cached ART requires train_conditional_velocities from the rollout transformer.")
+            if cache.ndim != 4 or cache.shape != latents.shape or cache.dtype != torch.float32:
+                raise ValueError(
+                    "Cached ART requires float32 train_conditional_velocities matching (B, T, L, D) states."
+                )
+            if cache.device != latents.device:
+                raise ValueError("Cached ART conditional velocities and states must be on the same device.")
+            old_prediction = cache[:, step].detach()
+            if not torch.isfinite(old_prediction).all():
+                raise ValueError("Cached ART conditional velocities must be finite.")
         model_inputs, negative_model_inputs, _, xt, t_expanded = self.prepare_model_inputs(
             micro_batch=micro_batch, step=step
         )
-        # No reference forward: DiffusionART has no KL term.
-        old_prediction, forward_prediction, _ = self._adapter_predictions(
-            model_inputs, negative_model_inputs, reference=False
-        )
+        if cached:
+            if negative_model_inputs is not None:
+                raise ValueError("Cached ART requires a conditional-only training forward (training CFG=1).")
+            forward_prediction = forward(
+                module=self.module,
+                model_config=self.model_config,
+                model_inputs=model_inputs,
+                negative_model_inputs=None,
+            )
+            if not isinstance(forward_prediction, torch.Tensor) or forward_prediction.shape != old_prediction.shape:
+                raise ValueError("Cached ART current conditional prediction must match the cached joint velocity.")
+            self._record_conditional_cache_audit(micro_batch, old_prediction, forward_prediction, step)
+        else:
+            # No reference forward: DiffusionART has no KL term.
+            old_prediction, forward_prediction, _ = self._adapter_predictions(
+                model_inputs, negative_model_inputs, reference=False
+            )
 
         model_output = self.prepare_model_outputs(
             output=(old_prediction, forward_prediction, xt, t_expanded), micro_batch=micro_batch
@@ -1801,7 +1951,9 @@ class ARTDiffusersFSDPEngine(NFTDiffusersFSDPEngine):
         if loss_function is not None:
             # prepare_model_inputs -> _flow_time stored num_train_timesteps on this micro batch.
             num_train_timesteps = tu.get_non_tensor_data(micro_batch, "num_train_timesteps", default=None)
-            loss_inputs = self.art_loss_inputs(micro_batch, step, xt, t_expanded, int(num_train_timesteps))
+            loss_inputs = self.art_loss_inputs(
+                micro_batch, step, xt, t_expanded, int(num_train_timesteps), include_rollout_velocity=not cached
+            )
             data = tu.get_tensordict(loss_inputs)
             tu.assign_non_tensor(
                 data,

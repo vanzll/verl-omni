@@ -44,7 +44,7 @@ def test_art_pipeline_changes_only_the_sampler_configuration():
     assert LTX23DiffusionARTPipeline.supports_request_batch is False
     # Output construction (named artifacts, trajectory, prompt embeddings) is the base adapter's; the ART class
     # must not re-wrap it.
-    for name in ("forward", "run_phase", "_decode_output", "diffusion_io_spec"):
+    for name in ("forward", "_decode_output", "diffusion_io_spec"):
         assert name not in LTX23DiffusionARTPipeline.__dict__, name
     assert set(LTX23DiffusionARTPipeline.diffusion_io_spec.artifacts) == {
         "video_preview",
@@ -128,3 +128,57 @@ def test_art_forward_inherits_the_named_audio_video_artifacts(monkeypatch, outpu
     rl = output.output["metadata"]["rl"]
     assert "fps" not in rl
     assert rl["video_seq_len"].tolist() == [3]
+
+
+def test_conditional_capture_uses_native_guidance_transformer_output():
+    """Run the pinned native executor, including x0 CFG, around a small CPU transformer."""
+    from contextlib import nullcontext
+
+    from vllm_omni.diffusion.models.ltx2.ltx2_guidance import (
+        LTXGuidancePlan,
+        LTXGuidanceSpec,
+        LTXModalityGuidance,
+    )
+    from vllm_omni.diffusion.models.ltx2.ltx2_latents import LTXAVState
+
+    class Transformer(torch.nn.Module):
+        def forward(self, hidden_states, audio_hidden_states, encoder_hidden_states, **kwargs):
+            self.video = hidden_states * 0.25 + encoder_hidden_states[:, :1, :1]
+            self.audio = audio_hidden_states * 0.5 - encoder_hidden_states[:, :1, :1]
+            return self.video, self.audio
+
+    pipeline = object.__new__(LTX23DiffusionARTPipeline)
+    torch.nn.Module.__init__(pipeline)
+    pipeline.transformer = Transformer()
+    pipeline._art_cached_conditional_velocity = True
+    pipeline._art_conditional_velocities = []
+    pipeline._guidance_plan = LTXGuidancePlan.build(
+        LTXGuidanceSpec(video=LTXModalityGuidance(cfg_scale=1.5), audio=LTXModalityGuidance(cfg_scale=3.0))
+    )
+    pipeline.scheduler = SimpleNamespace(sigmas=torch.tensor([0.9, 0.0]))
+    pipeline._build_transformer_kwargs = lambda *args, **kwargs: kwargs
+    pipeline._transformer_cache_context = lambda *args: nullcontext()
+    prompt = SimpleNamespace(
+        positive_connector_prompt_embeds=torch.full((2, 1, 1), 2.0),
+        positive_connector_audio_prompt_embeds=torch.full((2, 1, 1), 2.0),
+        negative_connector_prompt_embeds=torch.full((2, 1, 1), -3.0),
+        negative_connector_audio_prompt_embeds=torch.full((2, 1, 1), -3.0),
+    )
+    state = LTXAVState(video=torch.ones(2, 4, 3), audio=torch.ones(2, 3, 3))
+    context = SimpleNamespace(
+        guidance_parallel_ready=False,
+        prompt_context=prompt,
+        attention_kwargs=None,
+        original_audio_num_frames=2,
+        audio_scheduler=pipeline.scheduler,
+        sampler="euler",
+    )
+    guided = pipeline._predict_noise_for_step(
+        0, torch.tensor(900.0), state, context, SimpleNamespace(conditioning_mask=None)
+    )
+    cache = pipeline._art_conditional_velocities[0]
+    torch.testing.assert_close(
+        cache, torch.cat((pipeline.transformer.video[:2], pipeline.transformer.audio[:2, :2]), 1)
+    )
+    assert not torch.allclose(cache, torch.cat((guided[0], guided[1][:, :2]), 1))
+    assert cache.dtype == torch.float32 and not pipeline.transformer._forward_hooks

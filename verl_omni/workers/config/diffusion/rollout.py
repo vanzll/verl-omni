@@ -43,6 +43,10 @@ class DiffusionRolloutAlgoConfig(BaseConfig):
     sde_window_size: Optional[int] = None
     sde_window_range: Optional[list[int]] = None
     sde_contiguous: bool = True
+    # Protocol declaration only; joint ART does not change the rollout equation.
+    art_joint_latent: bool = False
+    # Capture positive conditional transformer outputs for actor replay.
+    art_cached_conditional_velocity: bool = False
 
     # MixGRPO-only configs
     sample_strategy: str = "random"

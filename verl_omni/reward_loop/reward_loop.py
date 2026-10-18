@@ -13,7 +13,12 @@
 # limitations under the License.
 import asyncio
 import copy
+import json
 import logging
+import os
+import socket
+import time
+from pathlib import Path
 
 import numpy as np
 import ray
@@ -35,7 +40,12 @@ from verl_omni.workers.config.reward import (
     validate_reward_model_terms,
 )
 
-from .replica_dispatch import dispatch_reward_groups
+from .replica_dispatch import (
+    SharedRewardBatchCache,
+    dispatch_reward_groups,
+    project_reward_data,
+    tensor_payload_inventory,
+)
 from .reward_model import MultiRewardModelManager
 from .reward_model_executor import (
     EngineRewardExecutor,
@@ -46,6 +56,10 @@ from .reward_model_executor import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _reward_option(owner, name, default):
+    return getattr(getattr(getattr(owner, "config", None), "reward", None), name, default)
 
 
 def _validate_named_reward_manager_cls(reward_manager_cls) -> None:
@@ -68,6 +82,9 @@ class OmniRewardLoopWorker(RewardLoopWorker):
         reward_model_specs=None,
     ):
         self.reward_model_specs = reward_model_specs or {}
+        self._reward_profile_enabled = bool(config.reward.get("profile_dispatch", False))
+        self._reward_wake_seconds = {}
+        self._reward_cold_loads = {}
         self.engine_reward_executors: dict[str, EngineRewardExecutor] = build_engine_reward_executors(
             self.reward_model_specs
         )
@@ -86,6 +103,7 @@ class OmniRewardLoopWorker(RewardLoopWorker):
 
     async def compute_score_batch(self, data: DataProto) -> list[dict]:
         """Keep sample work inside its RPC lifetime, including on failure."""
+        started = time.perf_counter()
         results = await asyncio.gather(
             *(self.compute_score(data[index : index + 1]) for index in range(len(data))),
             return_exceptions=True,
@@ -93,6 +111,15 @@ class OmniRewardLoopWorker(RewardLoopWorker):
         for result in results:
             if isinstance(result, BaseException):
                 raise result
+        if results and getattr(self, "_reward_profile_enabled", False):
+            results[0]["_reward_worker_profile"] = {
+                "compute_seconds": time.perf_counter() - started,
+                "host": socket.gethostname().split(".")[0], "pid": os.getpid(),
+                "gpu_ids": list(map(str, ray.get_gpu_ids())),
+                "wake_seconds": dict(self._reward_wake_seconds),
+                "cold_load_counts": dict(self._reward_cold_loads),
+                "allocated_bytes": torch.cuda.memory_allocated() if torch.cuda.is_available() else 0,
+            }
         return results
 
     async def wake_up_reward_model(self, model_name: str) -> None:
@@ -100,7 +127,12 @@ class OmniRewardLoopWorker(RewardLoopWorker):
             executor = self.native_reward_executors[model_name]
         except KeyError as exc:
             raise ValueError(f"Worker has no native reward model {model_name!r}") from exc
+        started = time.perf_counter()
+        cold_load = getattr(executor, "_model", None) is None
         await executor.wake_up()
+        if getattr(self, "_reward_profile_enabled", False):
+            self._reward_wake_seconds[model_name] = time.perf_counter() - started
+            self._reward_cold_loads[model_name] = self._reward_cold_loads.get(model_name, 0) + int(cold_load)
 
     async def sleep_reward_model(self, model_name: str) -> None:
         try:
@@ -336,9 +368,16 @@ class OmniRewardLoopManager(RewardLoopManager):
             return await asyncio.to_thread(super().compute_rm_score, data)
         async with self._score_lock:
             scoring_error = None
+            result = None
+            started = time.perf_counter()
+            wake_finished = started
+            score_finished = started
             try:
                 await self._drain_lifecycle(self.multi_reward_model_manager.wake_up())
-                return await self._compute_named_model_scores(data)
+                wake_finished = time.perf_counter()
+                result = await self._compute_named_model_scores(data)
+                score_finished = time.perf_counter()
+                return result
             except BaseException as exc:
                 scoring_error = exc
                 raise
@@ -349,10 +388,69 @@ class OmniRewardLoopManager(RewardLoopManager):
                     if scoring_error is None:
                         raise
                     logger.exception("Failed to sleep reward models after scoring failed")
+                if result is not None and _reward_option(self, "profile_dispatch", False):
+                    finished = time.perf_counter()
+                    diagnostics = result.meta_info.pop("reward_dispatch_diagnostics")
+                    diagnostics.update(
+                        wake_seconds=wake_finished - started,
+                        scoring_seconds=score_finished - wake_finished,
+                        sleep_seconds=finished - score_finished,
+                        total_seconds=finished - started,
+                        observed_unix=time.time(), attempt=os.environ.get("OMNI_ATTEMPT"),
+                        validate=bool(data.meta_info.get("validate", False)), samples=len(data),
+                    )
+                    metrics = {f"perf/reward/{key}": diagnostics[key] for key in
+                               ("wake_seconds", "scoring_seconds", "sleep_seconds", "total_seconds")}
+                    for key, value in diagnostics.get("shared_rpc_batches", {}).items():
+                        metrics[f"perf/reward/shared_rpc_batches/{key}"] = value
+                    for name, group in diagnostics["groups"].items():
+                        replicas = group["replicas"]
+                        for key in ("samples", "rpcs", "slice_seconds", "submit_seconds",
+                                    "rpc_inflight_seconds", "worker_compute_seconds"):
+                            metrics[f"perf/reward/{name}/{key}"] = sum(row[key] for row in replicas)
+                        metrics[f"perf/reward/{name}/replicas"] = len(replicas)
+                        metrics[f"perf/reward/{name}/samples_per_second"] = (
+                            sum(row["samples"] for row in replicas) / max(diagnostics["dispatch_seconds"], 1e-9)
+                        )
+                    for key, value in metrics.items():
+                        result.non_tensor_batch[key] = np.full(len(data), value)
+                    result.meta_info["reward_extra_keys"].extend(metrics)
+                    directory = os.environ.get("OUTPUT_DIR")
+                    if directory:
+                        try:
+                            with (Path(directory) / "logs/reward_dispatch_profile.jsonl").open("a") as stream:
+                                stream.write(json.dumps(diagnostics) + "\n")
+                        except OSError:
+                            logger.exception("Unable to write reward performance diagnostics")
 
     async def _compute_named_model_scores(self, data: DataProto) -> DataProto:
+        excluded = _reward_option(self, "rpc_excluded_tensor_keys", [])
+        transport_data = project_reward_data(data, excluded)
+        diagnostics = {} if _reward_option(self, "profile_dispatch", False) else None
+        if diagnostics is not None:
+            diagnostics["input_tensors"] = tensor_payload_inventory(data)
+            diagnostics["transport_tensors"] = tensor_payload_inventory(transport_data)
+            phase = (bool(data.meta_info.get("validate", False)), len(data))
+            profiled = getattr(self, "_reward_payload_profiled_phases", set())
+            if phase not in profiled and len(data):
+                context = ray._private.worker.global_worker.get_serialization_context()
+                payloads = {}
+                for label, sample in (("original", data[:2]), ("projected", transport_data[:2])):
+                    started = time.perf_counter()
+                    serialized = context.serialize(sample)
+                    payloads[label] = {"bytes": serialized.total_bytes,
+                                       "serialization_seconds": time.perf_counter() - started}
+                    del serialized
+                diagnostics["same_input_ray_serialization_probe"] = payloads
+                self._reward_payload_profiled_phases = profiled | {phase}
+        batch_cache = None
+        if _reward_option(self, "share_rpc_batches", False):
+            batch_cache = SharedRewardBatchCache(
+                self._reward_worker_groups, ray.put, _reward_option(self, "shared_rpc_cache_batches", 16)
+            )
         group_outputs = await dispatch_reward_groups(
-            data, self._reward_worker_groups, self._reward_dispatch_batch_sizes
+            transport_data, self._reward_worker_groups, self._reward_dispatch_batch_sizes,
+            diagnostics=diagnostics, batch_cache=batch_cache,
         )
 
         merged_scores = []
@@ -374,6 +472,8 @@ class OmniRewardLoopManager(RewardLoopManager):
             merged_infos.append(info)
 
         meta_info = {}
+        if diagnostics is not None:
+            meta_info["reward_dispatch_diagnostics"] = diagnostics
         if self._preserve_reward_components:
             reward_names = sorted(self.config.reward.reward_functions)
             if not reward_names or not merged_infos:
