@@ -820,7 +820,10 @@ class BaseRayDiffusionTrainer(ABC):
 
             # pad to be divisible by dp_size
             size_divisor = self.config.actor_rollout_ref.rollout.agent.num_workers
-            test_gen_batch_padded, pad_size = pad_dataproto_to_divisor(test_gen_batch, size_divisor)
+            if self.config.actor_rollout_ref.model.get("full_finetune", False):
+                test_gen_batch_padded, pad_size = test_gen_batch, 0
+            else:
+                test_gen_batch_padded, pad_size = pad_dataproto_to_divisor(test_gen_batch, size_divisor)
             test_output_gen_batch_padded = self.async_rollout_manager.generate_sequences(test_gen_batch_padded)
 
             if self.use_rm and "rm_scores" not in test_output_gen_batch_padded.batch.keys():
@@ -952,6 +955,8 @@ class BaseRayDiffusionTrainer(ABC):
                 raise FloatingPointError(f"Invalid campaign validation reward matrix shape={scores.shape}.")
             for index, name in enumerate(names):
                 metric_dict[f"val/reward_raw/{name}/mean"] = float(scores[:, index].mean())
+            if self.config.actor_rollout_ref.model.get("full_finetune", False):
+                metric_dict["val/reward_raw/arithmetic_mean"] = float(scores.mean())
             weighted = scores @ weights
             metric_dict["val/reward_weighted_total/mean"] = float(weighted.mean())
             metric_dict["val/reward_weighted_total/std"] = float(weighted.std())
@@ -1122,6 +1127,11 @@ class BaseRayDiffusionTrainer(ABC):
         manager_class_fqn = self.config.actor_rollout_ref.rollout.get("agent", {}).get("agent_loop_manager_class")
         if manager_class_fqn:
             AgentLoopManager = load_class_from_fqn(manager_class_fqn, "AgentLoopManager")
+        elif self.config.actor_rollout_ref.model.get("full_finetune", False):
+            from verl_omni.agent_loop import DiffusionAgentLoopWorker
+            from verl_omni.agent_loop.full32_manager import Full32AgentLoopManager as AgentLoopManager
+
+            AgentLoopManager.agent_loop_workers_class = ray.remote(DiffusionAgentLoopWorker)
         else:
             from verl.experimental.agent_loop import AgentLoopManager
 
@@ -1441,6 +1451,8 @@ class BaseRayDiffusionTrainer(ABC):
             raise FloatingPointError(f"Invalid campaign raw reward matrix shape={scores.shape}.")
         total = scores @ weights
         result = {f"train/reward_raw/{name}/mean": float(scores[:, index].mean()) for index, name in enumerate(names)}
+        if self.config.actor_rollout_ref.model.get("full_finetune", False):
+            result["train/reward_raw/arithmetic_mean"] = float(scores.mean())
         result["train/reward_weighted_total/mean"] = float(total.mean())
         result["train/reward_weighted_total/std"] = float(total.std())
         return result
@@ -2265,6 +2277,13 @@ class DirectPreferenceRayTrainer(BaseRayDiffusionTrainer):
                     with marked_timer("update_weights", timing_raw, color="red"):
                         self.checkpoint_manager.update_weights(self.global_steps)
 
+                    if self.global_steps == 1 and self.config.actor_rollout_ref.model.get("full_finetune", False):
+                        from verl_omni.utils.full32_gate import record_full32_startup_gate
+
+                        with marked_timer("full32_gate", timing_raw):
+                            gate = record_full32_startup_gate(self.actor_rollout_wg.get_full32_policy_state())
+                        metrics["full32/native_gate_passed"] = 1.0
+                        metrics["full32/output_change_observed_receivers"] = gate["output_change_observed_receivers"]
                     actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                     metrics.update(actor_output_metrics)
 

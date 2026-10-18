@@ -2053,7 +2053,23 @@ class DiffusionARTLoss(DiffusionLossFn):
                 problems.append("art_first_update_mask_exempt requires art_prompt_balanced_split")
             if int(config.data.train_batch_size) != 2 * int(actor_cfg.ppo_mini_batch_size):
                 problems.append("art_first_update_mask_exempt requires exactly two disjoint updates")
-        if not int(model_cfg.get("lora_rank", 0) or 0) > 0:
+        full = bool(model_cfg.get("full_finetune", False))
+        if full:
+            if int(model_cfg.get("lora_rank", 0) or 0) != 0 or model_cfg.get("lora_adapter_path", None) is not None:
+                problems.append("Full ART forbids LoRA adapters and adapter initialization")
+            if not joint or not cached:
+                problems.append("Full ART requires joint latent and cached conditional velocity, with no old teacher")
+            if actor_cfg.get("strategy") != "fsdp2":
+                problems.append("Full ART currently requires actor.strategy=fsdp2")
+            if int(OmegaConf.select(actor_cfg, "fsdp_config.fsdp_size", default=0)) != 32:
+                problems.append("Full ART requires true32-rank sharding")
+            if not OmegaConf.select(actor_cfg, "fsdp_config.reshard_after_forward", default=False):
+                problems.append("Full ART requires reshard_after_forward=true")
+            if actor_cfg.get("use_no_sync_for_gradient_accumulation", False):
+                problems.append("Full ART forbids retaining full unsharded gradients with no_sync")
+            if OmegaConf.select(rollout_cfg, "checkpoint_engine.backend", default="naive") != "naive":
+                problems.append("Full ART requires validated bucketed naive IPC synchronization")
+        elif not int(model_cfg.get("lora_rank", 0) or 0) > 0:
             problems.append("actor_rollout_ref.model.lora_rank must be > 0 (DiffusionART trains LoRA adapters)")
         if "old" not in tuple(model_cfg.get("policy_state_adapters", ("default",))):
             problems.append('actor_rollout_ref.model.policy_state_adapters must include "old"')
@@ -2477,6 +2493,14 @@ class DiffusionARTLoss(DiffusionLossFn):
             batch_metrics.update(cls.reward_summaries(*components))
         states, next_states, all_timesteps = cls._trajectory(batch)
         batch_size, num_steps = all_timesteps.shape
+        if bool(getattr(getattr(config.actor_rollout_ref, "model", None), "full_finetune", False)):
+            policy_versions = batch.batch.get("art_policy_version")
+            if policy_versions is None or policy_versions.shape != (batch_size,) or (
+                policy_versions.dtype != torch.int64
+            ):
+                raise ValueError("Full ART requires a native committed policy version for every cached trajectory.")
+            if not torch.equal(policy_versions, policy_versions[:1].expand_as(policy_versions)):
+                raise ValueError("Full ART cannot mix cached trajectories from different policies.")
         joint = bool(algorithm_cfg.get("art_joint_latent", False))
         conditional_velocities = None
         if algorithm_cfg.get("art_cached_conditional_velocity", False):

@@ -73,6 +73,8 @@ from verl_omni.utils.diffusion_compile import _maybe_compile_repeated_blocks
 from verl_omni.utils.fsdp_utils import apply_fsdp2, collect_lora_params
 from verl_omni.workers.config import DiffusionModelConfig
 from verl_omni.workers.engine.lora_adapter_mixin import LoRAAdapterMixin
+from verl_omni.workers.engine.full_policy import FullPolicyMixin, parameter_ownership
+from verl_omni.utils.tensor_audit import tensor_sample
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -145,7 +147,7 @@ def _fsdp_param_dtype(
     return configured_dtype
 
 
-class DiffusersFSDPEngine(LoRAAdapterMixin, BaseEngine, ABC):
+class DiffusersFSDPEngine(FullPolicyMixin, LoRAAdapterMixin, BaseEngine, ABC):
     """Base Diffusers engine using PyTorch FullyShardedDataParallel (FSDP).
 
     Supports model sharding, activation/optimizer offloading, LoRA, and sequence parallelism.
@@ -186,6 +188,7 @@ class DiffusersFSDPEngine(LoRAAdapterMixin, BaseEngine, ABC):
         self._is_offload_param = self.engine_config.param_offload
         self._is_offload_optimizer = self.engine_config.optimizer_offload
         self._is_lora = self.model_config.lora_rank > 0
+        self._initialize_full_policy()
         # FSDP2 CPUOffloadPolicy owns param placement; a manual model.to(device) would
         # leave shards on CPU and crash state_dict()/weight-sync (upstream verl#5995).
         # Set True in _build_fsdp_module to skip that manual load.
@@ -331,12 +334,23 @@ class DiffusersFSDPEngine(LoRAAdapterMixin, BaseEngine, ABC):
         with init_context(), warnings.catch_warnings():
             warnings.simplefilter("ignore")
 
-            module = _load_diffusers_pretrained(
-                self.model_config.config_path or self.model_config.local_path,
-                torch_dtype=torch_dtype,
-                trust_remote_code=self.model_config.trust_remote_code,
-                subfolder="" if self.model_config.config_path else self.model_config.transformer_subfolder,
-            )
+            if self.full_finetune and self.rank != 0:
+                from diffusers import LTX2VideoTransformer3DModel
+
+                configuration = LTX2VideoTransformer3DModel.load_config(
+                    self.model_config.config_path or self.model_config.local_path,
+                    subfolder="" if self.model_config.config_path else self.model_config.transformer_subfolder,
+                    local_files_only=True,
+                )
+                with torch.device("meta"):
+                    module = LTX2VideoTransformer3DModel.from_config(configuration)
+            else:
+                module = _load_diffusers_pretrained(
+                    self.model_config.config_path or self.model_config.local_path,
+                    torch_dtype=torch_dtype,
+                    trust_remote_code=self.model_config.trust_remote_code,
+                    subfolder="" if self.model_config.config_path else self.model_config.transformer_subfolder,
+                )
             try:
                 module.set_attention_backend(self.model_config.attn_backend)
             except Exception as e:
@@ -367,6 +381,12 @@ class DiffusersFSDPEngine(LoRAAdapterMixin, BaseEngine, ABC):
             module.can_generate = lambda: False
             module.config.save_pretrained = save_config.__get__(module.config)
 
+        if self.full_finetune:
+            self._full_event("pre_shard_model", initialization="rank0_pretrained" if self.rank == 0 else "config_meta",
+                             materialized_parameter_bytes=sum(parameter.numel() * parameter.element_size()
+                                                              for parameter in module.parameters()
+                                                              if not parameter.is_meta),
+                             total_parameter_numel=sum(parameter.numel() for parameter in module.parameters()))
         return module
 
     def _build_fsdp_module(self, module):
@@ -462,7 +482,7 @@ class DiffusersFSDPEngine(LoRAAdapterMixin, BaseEngine, ABC):
                 "offload_policy": offload_policy,
                 "reshard_after_forward": self.engine_config.reshard_after_forward,
             }
-            full_state = module.state_dict()
+            full_state = module.state_dict() if not self.full_finetune or self.rank == 0 else {}
             apply_fsdp2(module, fsdp_kwargs, self.engine_config, ignored_names=ignored_names)
             fsdp2_load_full_state_dict(module, full_state, fsdp_mesh, offload_policy)
         else:
@@ -538,6 +558,8 @@ class DiffusersFSDPEngine(LoRAAdapterMixin, BaseEngine, ABC):
         else:
             # configure trainable parameters for non-lora training
             DiffusionModelBase.get_class(self.model_config).configure_trainable_params(module, self.model_config)
+            if self.full_finetune:
+                module.requires_grad_(True)
 
         if self.use_ulysses_sp:
             sp_size = self.ulysses_sequence_parallel_size
@@ -578,6 +600,15 @@ class DiffusersFSDPEngine(LoRAAdapterMixin, BaseEngine, ABC):
         self.scheduler = scheduler
         self.optimizer = optimizer
         self.lr_scheduler = lr_scheduler
+        if self.full_finetune:
+            self._assert_full_runtime_sharding()
+            ownership = parameter_ownership(self.module, self.optimizer)
+            self._full_event("initialized_shards", actor_strategy=self.engine_config.strategy,
+                             sample_dp_size=self.get_data_parallel_size(),
+                             mesh_names=list(self.device_mesh.mesh_dim_names),
+                             mesh_ranks=self.device_mesh.mesh.tolist(),
+                             reshard_after_forward=self.engine_config.reshard_after_forward,
+                             **ownership, **self._full_memory())
 
     def train_mode(self, **kwargs):
         """
@@ -759,7 +790,10 @@ class DiffusersFSDPEngine(LoRAAdapterMixin, BaseEngine, ABC):
         if not torch.isfinite(grad_norm):
             self.optimizer.zero_grad()
             raise FloatingPointError(f"Non-finite grad_norm {grad_norm}; optimizer step was not applied.")
+        before = self._full_parameter_samples() if self.full_finetune else None
         self.optimizer.step()
+        if self.full_finetune:
+            self._full_step_applied(before, grad_norm.item())
         return grad_norm.item()
 
     def lr_scheduler_step(self):
@@ -849,6 +883,47 @@ class DiffusersFSDPEngine(LoRAAdapterMixin, BaseEngine, ABC):
         self, layered_summon=False, base_sync_done=False, adapter_name: str | None = None, **kwargs
     ):
         """Export the transformer weights for a rollout-engine weight sync."""
+        if self.full_finetune:
+            version = self._full_export_version(adapter_name)
+            params = convert_weight_keys(self.module.state_dict(), self.module)
+            names = list(params)
+            sample_names = names[::max(1, len(names) // 16)]
+            self._full_sync_metadata = {
+                "policy_version": version,
+                "tensors": {f"transformer.{name}": {"shape": list(parameter.shape), "dtype": str(parameter.dtype)}
+                            for name, parameter in params.items()},
+                "sample_names": [f"transformer.{name}" for name in sample_names],
+            }
+
+            def streamed_full_weights():
+                names = []
+                total_bytes = 0
+                maximum_tensor_bytes = 0
+                samples = {}
+                self._full_event("export_begin", exported_version=version)
+                for name, parameter in params.items():
+                    if self._full_policy_version != version or self._full_old_version != version:
+                        raise RuntimeError("Full actor changed during frozen boundary export.")
+                    tensor = (
+                        parameter.to(get_device_id()).full_tensor() if isinstance(parameter, DTensor) else parameter
+                    )
+                    tensor = tensor.detach()
+                    size = tensor.numel() * tensor.element_size()
+                    names.append(name)
+                    total_bytes += size
+                    maximum_tensor_bytes = max(maximum_tensor_bytes, size)
+                    if name in sample_names:
+                        samples[f"transformer.{name}"] = tensor_sample(tensor)
+                    yield f"transformer.{name}", tensor
+                    del tensor
+                if self._full_policy_version != version or self._full_old_version != version:
+                    raise RuntimeError("Full actor changed before frozen export completed.")
+                self._full_last_export_version = version
+                self._full_event("export_complete", exported_version=version, tensor_names=names,
+                                 total_bytes=total_bytes, maximum_tensor_bytes=maximum_tensor_bytes,
+                                 source_samples=samples)
+
+            return streamed_full_weights(), None
         log_gpu_memory_usage("Before load_fsdp_model_to_gpu", logger=logger)
 
         # FSDP2 CPUOffloadPolicy owns CPU<->GPU placement; calling model.to(device) here
@@ -1090,6 +1165,8 @@ class DiffusersFSDPEngine(LoRAAdapterMixin, BaseEngine, ABC):
 
     def _gradient_sync_context(self, *, is_last_micro_batch: bool):
         """Reuse verl FSDPEngine: skip reduce-scatter until the last accumulation step."""
+        if self.full_finetune:
+            raise ValueError("Full mode requires reduce-scatter on every microbatch, never no_sync.")
         from verl.workers.engine.fsdp.transformer_impl import FSDPEngine
 
         return FSDPEngine._gradient_sync_context(self, is_last_micro_batch=is_last_micro_batch)
@@ -1102,6 +1179,8 @@ class DiffusersFSDPEngine(LoRAAdapterMixin, BaseEngine, ABC):
         *,
         timesteps_key: str,
     ) -> dict:
+        if self.full_finetune and not forward_only:
+            self._validate_full_cached_window(data, timesteps_key)
         stage_inputs = tu.get_non_tensor_data(data, "enable_timestep_staging", default=False) and not forward_only
         if stage_inputs:
             step_fields, shared_keys = self._prepare_timestep_staging(data, timesteps_key)

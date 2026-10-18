@@ -26,6 +26,7 @@ extension and verl's delta loader into a toy rollout model whose
 ZMQ/NCCL transport is faked.
 """
 
+import asyncio
 import json
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -466,7 +467,7 @@ def test_delta_apply_rejects_npu_platform(monkeypatch):
         _run_ipc(worker, [[(f"{SPEC_NAME}#0", torch.zeros(1, dtype=torch.uint8))]], monkeypatch)
 
 
-def test_registry_keeps_verl_server_adapter():
+def test_registry_keeps_verl_server_adapter(monkeypatch):
     """The delta wire rides verl's stock named_tensors bucketed channel; the omni
     subclass inherits the weight sender and server-handle setup."""
     from verl.workers.rollout.base import get_rollout_class
@@ -474,8 +475,20 @@ def test_registry_keeps_verl_server_adapter():
 
     adapter_class = get_rollout_class("vllm_omni", "async")
     assert issubclass(adapter_class, ServerAdapter)
-    assert adapter_class.update_weights is ServerAdapter.update_weights
     assert adapter_class._ensure_server_handle is ServerAdapter._ensure_server_handle
+    calls = []
+
+    async def inherited(instance, weights, **kwargs):
+        calls.append((instance, weights, kwargs))
+        return "stock-lora-path"
+
+    monkeypatch.setenv("OMNI_FULL_FINETUNE", "0")
+    monkeypatch.setattr(ServerAdapter, "update_weights", inherited)
+    instance = object.__new__(adapter_class)
+    weights = iter(())
+    result = asyncio.run(instance.update_weights(weights, global_steps=7, wire_format="named_tensors", extra="same"))
+    assert result == "stock-lora-path"
+    assert calls == [(instance, weights, {"global_steps": 7, "wire_format": "named_tensors", "extra": "same"})]
 
 
 def _flattened_pairs(flushes):

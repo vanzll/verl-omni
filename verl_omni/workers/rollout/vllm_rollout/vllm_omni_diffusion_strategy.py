@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import logging
+import os
 from argparse import Namespace
 from collections.abc import Mapping
 from dataclasses import asdict
@@ -493,6 +494,11 @@ class DiffusionStrategy(OmniStrategyBase):
     def _training_output_fields(self, final_res: OmniRequestOutput, *, context: str) -> dict[str, Any]:
         """Remove only declared training batch axes and preserve algorithm-owned keys."""
         fields: dict[str, Any] = {"global_steps": self.server.global_steps}
+        if os.environ.get("OMNI_FULL_FINETUNE") == "1":
+            version = getattr(self.server, "_full_committed_policy_version", None)
+            if version is None or version != 2 * self.server.global_steps:
+                raise RuntimeError("Full rollout cache cannot be produced before native weight commit.")
+            fields["art_policy_version"] = torch.tensor(version, dtype=torch.int64)
         for name, source, value in (
             ("all_latents", "trajectory_latents", final_res.trajectory_latents),
             ("all_timesteps", "trajectory_timesteps", final_res.trajectory_timesteps),

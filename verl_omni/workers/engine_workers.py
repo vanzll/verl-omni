@@ -69,7 +69,7 @@ from verl_omni.workers.config import (
     OmniModelConfig,
 )
 from verl_omni.workers.config.diffusion import DiffusionDistillationTeacherModelConfig
-from verl_omni.workers.rollout.base import get_rollout_sequence_parallel_size
+from verl_omni.workers.rollout.base import get_rollout_sequence_parallel_size, get_rollout_world_size
 from verl_omni.workers.rollout.vllm_rollout.zmq_utils import make_update_zmq_handle, make_update_zmq_id
 from verl_omni.workers.utils.losses import diffusion_loss, omni_loss
 
@@ -408,6 +408,10 @@ class TrainingWorker(Worker, DistProfilerExtension):
                 # Non-finite gradients now raise, so this counts successful
                 # global updates once rather than once per data-parallel rank.
                 metrics["optimizer_updates"] = [total_num_iterations]
+                if getattr(self.engine, "full_finetune", False):
+                    for name, value in self.engine._full_last_step.items():
+                        if isinstance(value, (int, float)):
+                            metrics[f"full/{name}"] = [value]
 
                 output = tu.get_tensordict(tensor_dict={}, non_tensor_dict={"metrics": metrics}).cpu()
             else:
@@ -1007,6 +1011,17 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         }
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    async def get_full32_policy_state(self):
+        from verl_omni.workers.rollout.vllm_rollout.full_weight_sync import unpack_full_policy_sync_replies
+
+        assert "actor" in self.role
+        actor = self.actor.engine.full_policy_state()
+        rollout = await self.rollout._execute_method("get_full_policy_sync_state")
+        if rollout is not None:
+            rollout = [unpack_full_policy_sync_replies(rollout, get_rollout_world_size(self.config.rollout))]
+        return {"actor": actor, "rollout": rollout}
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def copy_adapter(self, source: str = "default", target: str = "old"):
         assert "actor" in self.role, "copy_adapter only supports actor role"
         self.actor.copy_adapter(source=source, target=target)
@@ -1250,6 +1265,9 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 base_sync_done=True,
                 adapter_name=self.rollout_adapter,
             )
+            if getattr(self.actor.engine, "full_finetune", False):
+                metadata = dict(self.actor.engine._full_sync_metadata, global_steps=global_steps)
+                await self.rollout._execute_method("set_full_policy_sync_metadata", kwargs={"metadata": metadata})
 
             do_lora_base_sync = False
             if not self.peft_merge and peft_config is not None:

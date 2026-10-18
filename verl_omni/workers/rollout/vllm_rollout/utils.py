@@ -11,9 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import json
 import logging
 import os
+import socket
 import time
+from pathlib import Path
 
 import torch
 from verl.utils.device import get_visible_devices_keyword
@@ -85,6 +88,56 @@ class vLLMOmniColocateWorkerExtension(CustomPipelineWorkerExtension):
     """
 
     _pending_lora_peft_config: dict | None = None
+
+    def set_full_policy_sync_metadata(self, metadata):
+        if os.environ.get("OMNI_FULL_FINETUNE") != "1":
+            raise ValueError("Full weight metadata is only allowed in the opt-in Full allocation.")
+        if metadata["policy_version"] != 2 * metadata["global_steps"]:
+            raise ValueError("Full policy version does not match the two-update rollout boundary.")
+        previous = getattr(self, "_full_committed_state", None)
+        if getattr(self, "_full_pending_metadata", None) is not None:
+            raise RuntimeError("Full weight transaction already has unconsumed metadata.")
+        if previous is not None and metadata["policy_version"] < previous["policy_version"]:
+            raise ValueError("Full rollout cannot load an older policy version.")
+        self._full_pending_metadata = metadata
+        self._full_weight_sync_valid = False
+
+    def _full_local_policy_sync_state(self):
+        if os.environ.get("OMNI_FULL_FINETUNE") != "1":
+            raise ValueError("Full native policy state requires the opt-in Full allocation.")
+        committed = getattr(self, "_full_committed_state", None)
+        visible = os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",")
+        index = self.device.index if self.device.index is not None else torch.cuda.current_device()
+        if index >= len(visible) or not visible[index]:
+            raise RuntimeError("Full native rank cannot identify its physical GPU assignment.")
+        return {"ready": getattr(self, "_full_weight_sync_valid", False),
+                "hostname": socket.gethostname().split(".")[0], "physical_gpu": visible[index], "pid": os.getpid(),
+                "native_rank": torch.distributed.get_rank(),
+                "native_world_size": torch.distributed.get_world_size(),
+                "state": None if committed is None else {
+                    **{key: committed[key] for key in (
+                        "policy_version", "global_steps", "post_load_checks", "buckets"
+                    )},
+                    "source_tensor_count": len(committed["source_tensors"]),
+                    "loaded_target_count": len(committed["loaded_targets"]),
+                    "checked_kinds": committed["checked_kinds"],
+                    "initial_sync_completed": hasattr(self, "_full_initial_probe"),
+                    "fixed_input_output_change": committed.get("fixed_input_output_change")}}
+
+    def get_full_policy_sync_state(self):
+        from vllm_omni.diffusion.worker.diffusion_worker import _run_and_gather_rank_values
+
+        return _run_and_gather_rank_values("Full native policy state", self._full_local_policy_sync_state)
+
+    def _commit_full_policy_sync(self, state):
+        output = Path(os.environ["OUTPUT_DIR"]).resolve()
+        root = Path(os.environ["OMNI_RUNTIME_ROOT"]).resolve()
+        if not output.is_relative_to(root):
+            raise ValueError("Full rollout audit must be attempt-owned.")
+        with (output / "logs" / f"full32_rollout_{os.getpid()}.jsonl").open("a") as stream:
+            stream.write(json.dumps(dict(state, pid=os.getpid(), observed_unix=time.time())) + "\n")
+        self._full_committed_state = state
+        self._full_weight_sync_valid = True
 
     def __new__(cls, **kwargs):
         set_death_signal()
@@ -170,6 +223,9 @@ class vLLMOmniColocateWorkerExtension(CustomPipelineWorkerExtension):
 
         from verl.workers.rollout.vllm_rollout.bucketed_weight_transfer import BucketedWeightReceiver
 
+        if os.environ.get("OMNI_FULL_FINETUNE") == "1":
+            if peft_config is not None or self._pending_lora_peft_config is not None or delta_flush:
+                raise ValueError("Full ART cannot route through adapter or delta weight synchronization.")
         if peft_config is None and self._pending_lora_peft_config is not None:
             peft_config = self._pending_lora_peft_config
             base_sync_done = True
@@ -356,6 +412,44 @@ class vLLMOmniColocateWorkerExtension(CustomPipelineWorkerExtension):
                 # 0.26 removed DiffusionWorker/DiffusionModelRunner.load_weights;
                 # each pipeline exposes load_weights via AutoWeightsLoader.
                 pipeline = getattr(getattr(self, "model_runner", None), "pipeline", None)
+                if os.environ.get("OMNI_FULL_FINETUNE") == "1":
+                    from vllm.distributed import get_tensor_model_parallel_rank, get_tensor_model_parallel_world_size
+
+                    from verl_omni.workers.rollout.vllm_rollout.full_weight_sync import (
+                        FullWeightCoverage,
+                        fixed_ltx2_output_probe,
+                    )
+
+                    metadata = getattr(self, "_full_pending_metadata", None)
+                    if metadata is None or getattr(pipeline, "transformer", None) is None:
+                        raise RuntimeError("Full ART requires tagged transformer synchronization.")
+                    self._full_pending_metadata = None
+                    metadata = dict(metadata, tensor_parallel_rank=get_tensor_model_parallel_rank(),
+                                    tensor_parallel_size=get_tensor_model_parallel_world_size())
+                    audit = FullWeightCoverage(pipeline.transformer, metadata)
+                    receiver.receive_weights(on_bucket_received=lambda weights, is_last=False, *args, **kwargs:
+                                             audit.load_bucket(weights))
+                    state = audit.finish()
+                    previous = getattr(self, "_full_committed_state", None)
+                    if not getattr(self, "_full_output_change_observed", False):
+                        if previous is not None and previous["policy_version"] == state["policy_version"]:
+                            state["fixed_input_probe"] = previous["fixed_input_probe"]
+                        else:
+                            state["fixed_input_probe"] = fixed_ltx2_output_probe(pipeline.transformer)
+                        if state["policy_version"] == 0:
+                            self._full_initial_probe = state["fixed_input_probe"]
+                        else:
+                            initial = self._full_initial_probe
+                            delta = {}
+                            for branch in ("video", "audio"):
+                                before = torch.tensor(initial[branch]["values"])
+                                after = torch.tensor(state["fixed_input_probe"][branch]["values"])
+                                delta[branch] = {"changed_elements": int((before != after).sum()),
+                                                 "maximum_absolute_change": float((before - after).abs().max())}
+                            self._full_output_change_observed = any(item["changed_elements"] for item in delta.values())
+                            state["fixed_input_output_change"] = delta
+                    self._commit_full_policy_sync(state)
+                    return
                 if pipeline is not None and hasattr(pipeline, "load_weights"):
                     load_fn = pipeline.load_weights
                 elif hasattr(self, "load_weights"):

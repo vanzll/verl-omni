@@ -202,6 +202,7 @@ def engine_case(rollout):
     engine = cls()
     engine.module = TinyTransformer()
     engine.model_config = NS()
+    engine.full_finetune = False
     engine.get_data_parallel_group = lambda: None
     engine._adapter_predictions = lambda *a, **kw: pytest.fail("old adapter/forward must not run")
     engine.use_adapter = lambda *a, **kw: pytest.fail("must not switch adapter")
@@ -327,7 +328,7 @@ def test_projection_and_staging_keep_selected_cache(engine_case):
 
 def test_transport_preserves_actual_cache(rollout):
     rollout.run()
-    ns = {"torch": torch, "np": np, "Mapping": Mapping}
+    ns = {"torch": torch, "np": np, "Mapping": Mapping, "os": os}
     path = "verl_omni/workers/rollout/vllm_rollout/vllm_omni_diffusion_strategy.py"
     for name in ("_unbatch_training_field", "_rollout_metadata_groups"):
         load_source(path, name, ns)
@@ -378,6 +379,7 @@ def test_temporal_loop_preserves_late_injected_metadata(engine_case, stage_input
         get_device_id=lambda: "cpu",
         prepare_micro_batches=micro_batches,
         LoRAAdapterMixin=type("LoRAAdapterMixin", (), {}),
+        FullPolicyMixin=type("FullPolicyMixin", (), {}),
         BaseEngine=type("BaseEngine", (), {}),
         ABC=type("ABC", (), {}),
     )

@@ -64,11 +64,11 @@ def choose_service_ports():
     raise RuntimeError("No free disjoint Ray and collective service ports found")
 
 
-def batch_contract(micro):
+def batch_contract(micro, full=False):
     if micro not in (1, 2, 4):
         raise ValueError("update microbatch must be 1, 2 or 4")
     return {"prompts": 32, "K": 8, "rollout_samples": 256, "update_samples": 128,
-            "updates_per_rollout": 2, "DP": 32, "SP": 1, "fsdp_size": 1,
+            "updates_per_rollout": 2, "DP": 32, "SP": 1, "fsdp_size": 32 if full else 1,
             "update_microbatch": micro, "gradient_accumulation": 4 // micro,
             "infer_microbatch": 2, "rollout_TP": 2, "rollout_agent_workers": 16,
             "baseline_rollout_agent_workers": 8, "target_updates": None, "target_rollouts": None,
@@ -201,7 +201,9 @@ def prepare(args):
                    for base in ("/m2v_intern/zhenglin", "/m2v_intern2/zhenglin")):
             raise RuntimeError("write root must be an authorized isolated extension")
     runtime = choose_runtime(args.runtime_root, args.fallback_runtime_root)
-    run = "LTX23-A12JOINT32-P32K8-UNBOUNDED-S42-" + time.strftime("%Y%m%dT%H%M%S") + "-" + secrets.token_hex(3)
+    full = bool(getattr(args, "full_finetune", False))
+    prefix = "LTX23-ART-A12-FULL32-P32K8-U2-S42-" if full else "LTX23-A12JOINT32-P32K8-UNBOUNDED-S42-"
+    run = prefix + time.strftime("%Y%m%dT%H%M%S") + "-" + secrets.token_hex(3)
     output = runtime / "attempts" / run
     for directory in ("logs", "nodes", "provenance"):
         (output / directory).mkdir(parents=True, exist_ok=False)
@@ -242,7 +244,8 @@ def prepare(args):
                       OMNI_RAY_PORT=ray_port, OMNI_RAY_OBJECT_STORE_BYTES=OBJECT_STORE,
                       RAY_ADDRESS=f"{next(iter(PORTS))}:{ray_port}",
                       OMNI_NODE_DESCRIPTOR=str(descriptor), OMNI_LAUNCH_MANIFEST_SHA256=launch_sha,
-                      OMNI_VARIANT="A12JOINT32", RUN_NAME=run, OUTPUT_DIR=str(output),
+                      OMNI_VARIANT="ART_FULL32" if full else "A12JOINT32", OMNI_FULL_FINETUNE=int(full),
+                      RUN_NAME=run, OUTPUT_DIR=str(output),
                       WANDB_RUN_ID=run_id, WANDB_RESUME="never", WANDB_MODE="online", WANDB_ENTITY=args.wandb_entity,
                       OMNI_UPDATE_MICROBATCH=args.update_microbatch, OMNI_ART_CACHE_ACCEPTANCE="1")
         for key, directory in {
@@ -262,7 +265,7 @@ def prepare(args):
                 "source_root": str(source), "source_manifest": str(args.source_manifest),
                 "source_manifest_sha256": args.source_manifest_sha256, "source_archive_sha256": args.source_archive_sha256,
                 "nodes": nodes, "launch_manifest": str(launch), "launch_manifest_sha256": launch_sha,
-                "contract": batch_contract(args.update_microbatch), "wandb_run_id": run_id,
+                "contract": batch_contract(args.update_microbatch, full=full), "wandb_run_id": run_id,
                 "checkpoint_writes": False, "resume": False, "collective_port": collective_port,
                 "gpu_validation": "pending_actual_gate32", "incident_review": str(args.incident_review)}
     atomic(output / "manifest.json", manifest)
@@ -416,6 +419,7 @@ def main():
         parser.add_argument("--fallback-runtime-root", type=Path,
                             default=Path("/m2v_intern2/zhenglin/omni_art_ablation_20261016/extensions/art_joint32"))
         parser.add_argument("--update-microbatch", type=int, choices=(1, 2, 4), default=4)
+        parser.add_argument("--full-finetune", action="store_true")
         prepare(parser.parse_args(sys.argv[2:]))
     else:
         raise ValueError("unsupported action")

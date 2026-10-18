@@ -81,8 +81,20 @@ def main():
                     torch.cuda.synchronize()
                     if not bool(torch.isfinite(value).all()) or not bool((value == 528).all()):
                         raise RuntimeError("32-rank sum mismatch")
+                sample_checks = []
+                if os.environ.get("OMNI_FULL_FINETUNE") == "1":
+                    from verl_omni.utils.tensor_audit import tensor_sample
+
+                    for count in (2**25, 2**26, 2**27):
+                        expanded = torch.full((1,), float(rank + 1), dtype=torch.bfloat16, device="cuda").expand(count)
+                        sample = tensor_sample(expanded)
+                        if sample["flat_indices"][-1] != count - 1 or sample["values"] != [float(rank + 1)] * 8:
+                            raise RuntimeError("Full-size CUDA diagnostic sampler failed.")
+                        sample_checks.append({"numel": count, "last_index": sample["flat_indices"][-1],
+                                              "storage_bytes": expanded.untyped_storage().nbytes()})
                 return {"rank": rank, "hostname": socket.gethostname().split(".")[0],
-                        "gpu_ids": ray.get_gpu_ids(), "finite": True, "cycles": 2}
+                        "gpu_ids": ray.get_gpu_ids(), "finite": True, "cycles": 2,
+                        "full_size_cuda_sample_checks": sample_checks}
             finally:
                 dist.destroy_process_group()
 

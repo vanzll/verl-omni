@@ -16,7 +16,7 @@
 import sys
 from pathlib import Path
 
-def expected(micro):
+def expected(micro, full=False):
     values = {
         "data.train_batch_size": 32, "data.seed": 42, "data.val_max_samples": 8,
         "data.val_batch_size": 8, "data.validation_shuffle": False,
@@ -59,6 +59,16 @@ def expected(micro):
         "trainer.expected_generated_samples_per_rollout": 256,
         "trainer.project_name": "diffusionart-omni-ablation", "trainer.campaign.checkpoint_format": "disabled",
     }
+    if full:
+        values.update({"actor_rollout_ref.model.full_finetune": True,
+                       "actor_rollout_ref.model.lora_rank": 0,
+                       "actor_rollout_ref.actor.strategy": "fsdp2",
+                       "actor_rollout_ref.actor.fsdp_config.strategy": "fsdp2",
+                       "actor_rollout_ref.actor.fsdp_config.fsdp_size": 32,
+                       "actor_rollout_ref.actor.fsdp_config.reshard_after_forward": True,
+                       "actor_rollout_ref.actor.use_no_sync_for_gradient_accumulation": False,
+                       "ray_kwargs.ray_init.runtime_env.env_vars.OMNI_FULL_FINETUNE": "1",
+                       "actor_rollout_ref.actor.checkpoint.save_lora_only": False})
     for branch in ("actor.diffusion_loss", "rollout.algo"):
         for key in ("art_joint_latent", "art_cached_conditional_velocity"):
             values[f"actor_rollout_ref.{branch}.{key}"] = True
@@ -98,13 +108,16 @@ def expected(micro):
     return values
 
 def validate(config, micro):
-    for key, wanted in expected(micro).items():
+    full = config["actor_rollout_ref"]["model"].get("full_finetune", False)
+    for key, wanted in expected(micro, full=full).items():
         actual = config
         for component in key.split("."):
             actual = actual[component]
         if actual != wanted:
             raise ValueError(f"{key}: actual={actual!r}, required={wanted!r}")
-    if "A12JOINT32" not in config["trainer"]["experiment_name"]:
+    prefix = "LTX23-ART-A12-FULL32-P32K8-U2-S42-" if full else "LTX23-A12JOINT32-"
+    name = config["trainer"]["experiment_name"]
+    if (full and not name.startswith(prefix)) or (not full and "A12JOINT32" not in name):
         raise ValueError("wrong experiment identity")
 
 if __name__ == "__main__":

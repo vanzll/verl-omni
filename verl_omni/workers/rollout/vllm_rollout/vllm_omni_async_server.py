@@ -382,6 +382,20 @@ class vLLMOmniHttpServer(vLLMHttpServer):
             self._invalidate_lora_request_cache()
 
     async def set_global_steps(self, global_steps: int):
+        if os.environ.get("OMNI_FULL_FINETUNE") == "1":
+            from verl_omni.workers.rollout.vllm_rollout.full_weight_sync import unpack_full_policy_sync_replies
+
+            replies = await self.collective_rpc(method="get_full_policy_sync_state")
+            expected = {"policy_version": 2 * global_steps, "global_steps": global_steps}
+            ranks = unpack_full_policy_sync_replies(replies, get_rollout_world_size(self.config))
+            for reply in ranks:
+                if not isinstance(reply, dict) or reply.get("ready") is not True or not isinstance(reply.get("state"), dict):
+                    raise RuntimeError("Full native rollout has an incomplete weight transaction.")
+                if reply.get("error") or reply.get("supported") is False:
+                    raise RuntimeError("Full native rollout rejected the policy transaction.")
+                if any(reply["state"].get(key) != value for key, value in expected.items()):
+                    raise RuntimeError("Full native rollout committed the wrong policy version.")
+            self._full_committed_policy_version = expected["policy_version"]
         if global_steps != self.global_steps:
             self._invalidate_lora_request_cache()
         await super().set_global_steps(global_steps)
@@ -626,6 +640,30 @@ class vLLMOmniHttpServer(vLLMHttpServer):
 
 class vLLMOmniServerAdapter(ServerAdapter):
     """Reuse verl's transport with SP-aware replica and IPC rank mapping."""
+
+    async def update_weights(self, weights, global_steps=None, wire_format="named_tensors", **kwargs):
+        if os.environ.get("OMNI_FULL_FINETUNE") != "1":
+            return await super().update_weights(weights, global_steps=global_steps, wire_format=wire_format, **kwargs)
+        if wire_format != "named_tensors" or global_steps is None:
+            raise ValueError("Full ART requires versioned named-tensor synchronization.")
+        from verl_omni.utils.full_weight_transfer import FullBoundedWeightSender
+
+        deadline = float(os.environ.get("VLLM_OMNI_DLO_DP_WAVE_TIMEOUT", "3600"))
+        future = await self._execute_method(
+            "update_weights_from_ipc", non_block=True, timeout=deadline,
+            kwargs={**kwargs, "use_shm": self.use_shm},
+        )
+        sender = FullBoundedWeightSender(
+            zmq_handle=self.zmq_handle,
+            bucket_size_mb=self.config.checkpoint_engine.update_weights_bucket_megabytes,
+            use_shm=self.use_shm, receiver_future=future, policy_version=2 * global_steps,
+        )
+        await sender.async_send_weights(weights)
+        if future is not None:
+            await asyncio.wait_for(future, timeout=deadline)
+        if self._has_server:
+            await self.server_handle.clear_kv_cache.remote()
+            await self.server_handle.set_global_steps.remote(global_steps)
 
     async def _execute_method(
         self,

@@ -99,6 +99,7 @@ class DiffusionModelConfig(BaseConfig):
         }
     )
 
+    full_finetune: bool = False
     lora_rank: int = 0
     lora_alpha: int = 64
     lora_init_weights: str = "gaussian"

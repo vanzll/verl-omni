@@ -22,7 +22,17 @@ output=${OUTPUT_DIR:?OUTPUT_DIR is required}
 run_name=${RUN_NAME:?RUN_NAME is required}
 source_sha=${SOURCE_SNAPSHOT_SHA256:?SOURCE_SNAPSHOT_SHA256 is required}
 ray_address=${RAY_ADDRESS:?}
-[[ "$run_name" == *A12JOINT32* ]] || exit 2
+if [[ "${OMNI_FULL_FINETUNE:-0}" == 1 ]]; then
+  [[ "$run_name" == LTX23-ART-A12-FULL32-P32K8-U2-S42-* ]] || exit 2
+  full_args=(++actor_rollout_ref.model.full_finetune=true actor_rollout_ref.model.lora_rank=0
+    actor_rollout_ref.actor.strategy=fsdp2 actor_rollout_ref.actor.fsdp_config.strategy=fsdp2
+    actor_rollout_ref.actor.fsdp_config.fsdp_size=32 actor_rollout_ref.actor.fsdp_config.reshard_after_forward=true
+    ++ray_kwargs.ray_init.runtime_env.env_vars.OMNI_FULL_FINETUNE='"1"'
+    actor_rollout_ref.actor.checkpoint.save_lora_only=false)
+else
+  [[ "$run_name" == *A12JOINT32* ]] || exit 2
+  full_args=()
+fi
 [[ "${WANDB_RESUME:-never}" == never ]] || exit 2
 export WANDB_RESUME=never
 : "${WANDB_RUN_ID:?fresh run ID required}"
@@ -126,4 +136,5 @@ exec bash "$repo/examples/diffusionart_trainer/ltx2/run_ltx2_t2av_art_lora.sh" \
   ++reward.profile_dispatch=true \
   ++reward.share_rpc_batches=true \
   ++reward.shared_rpc_cache_batches=16 \
-  trainer.resume_mode=disable
+  trainer.resume_mode=disable \
+  "${full_args[@]}"
