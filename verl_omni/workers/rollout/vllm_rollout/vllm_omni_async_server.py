@@ -151,6 +151,12 @@ class vLLMOmniHttpServer(vLLMHttpServer):
 
     def _post_init(self, cuda_visible_devices: str) -> None:
         """Run strategy post-init and preserve the replica device list."""
+        unset_names = os.environ.get("VERL_OMNI_NCCL_UNSET_ENV_VARS", "").split(",")
+        if any(name and not name.startswith("NCCL_") for name in unset_names):
+            raise ValueError("VERL_OMNI_NCCL_UNSET_ENV_VARS only accepts NCCL_ variables")
+        for name in unset_names:
+            if name:
+                os.environ.pop(name, None)
         if get_rollout_sequence_parallel_size(self.config) > 1:
             self.replica_world_size = get_rollout_world_size(self.config)
             profiler = self.profiler_controller

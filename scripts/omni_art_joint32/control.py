@@ -203,6 +203,7 @@ def prepare(args):
     runtime = choose_runtime(args.runtime_root, args.fallback_runtime_root)
     full = bool(getattr(args, "full_finetune", False))
     prefix = "LTX23-ART-A12-FULL32-P32K8-U2-S42-" if full else "LTX23-A12JOINT32-P32K8-UNBOUNDED-S42-"
+    prefix += "RDMA-RingSimple-"
     run = prefix + time.strftime("%Y%m%dT%H%M%S") + "-" + secrets.token_hex(3)
     output = runtime / "attempts" / run
     for directory in ("logs", "nodes", "provenance"):

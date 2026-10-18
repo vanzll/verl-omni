@@ -14,6 +14,8 @@
 
 """Transport-only runtime regressions without CUDA contexts or real hardware."""
 
+import ast
+import asyncio
 import copy
 import importlib.util
 import json
@@ -21,6 +23,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -103,6 +106,48 @@ def test_hydra_never_broadcasts_master_hca(monkeypatch, capsys):
     assert 'NCCL_NET="NCCL RDMA Plugin v9"' in output
     assert 'NCCL_ALGO="Ring"' in output
     assert 'NCCL_PROTO="Simple"' in output
+    assert "VERL_OMNI_NCCL_UNSET_ENV_VARS=" in output
+
+
+@pytest.mark.parametrize("policy", ["", ",".join(transport.CLEARED_ENVIRONMENT), "UNRELATED_SECRET"])
+def test_native_server_applies_opt_in_unset_policy_before_spawning(monkeypatch, policy):
+    path = ROOT / "verl_omni/workers/rollout/vllm_rollout/vllm_omni_async_server.py"
+    tree = ast.parse(path.read_text())
+    server = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "vLLMOmniHttpServer")
+    method = next(node for node in server.body if isinstance(node, ast.FunctionDef) and node.name == "_post_init")
+    probe = ast.ClassDef(
+        name="Probe", bases=[ast.Name(id="Base", ctx=ast.Load())], keywords=[], body=[method], decorator_list=[]
+    )
+
+    class Base:
+        def _post_init(self, devices):
+            self.finished = True
+
+    namespace = {
+        "Base": Base,
+        "os": os,
+        "asyncio": asyncio,
+        "LoRARequest": object,
+        "_LORA_REQUEST_CACHE_MISS": object(),
+        "get_rollout_sequence_parallel_size": lambda config: 1,
+    }
+    exec(compile(ast.fix_missing_locations(ast.Module(body=[probe], type_ignores=[])), str(path), "exec"), namespace)
+    instance = namespace["Probe"]()
+    instance.config = SimpleNamespace(full_determinism=False)
+    observed = []
+    instance._generate_strategy = SimpleNamespace(post_init=lambda devices: observed.append(dict(os.environ)))
+    for key in transport.CLEARED_ENVIRONMENT:
+        monkeypatch.setenv(key, "0")
+    monkeypatch.setenv("NCCL_ALGO", "Ring")
+    monkeypatch.setenv("VERL_OMNI_NCCL_UNSET_ENV_VARS", policy)
+    if policy == "UNRELATED_SECRET":
+        with pytest.raises(ValueError, match="only accepts NCCL_"):
+            instance._post_init("0,1")
+        assert not observed
+    else:
+        instance._post_init("0,1")
+        assert instance.finished and observed[0]["NCCL_ALGO"] == "Ring"
+        assert all((key not in observed[0]) == bool(policy) for key in transport.CLEARED_ENVIRONMENT)
 
 
 def test_library_hash_rejects_an_unvalidated_core(tmp_path):
