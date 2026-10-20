@@ -89,6 +89,10 @@ def run_rank(rank, rendezvous):
                     ["unpack_full_policy_sync_replies"], namespace)
         sync = SimpleNamespace(unpack_full_policy_sync_replies=namespace["unpack_full_policy_sync_replies"])
         sys.modules["verl_omni.workers.rollout.vllm_rollout.full_weight_sync"] = sync
+        clock_names = ["full_policy_sync_tag", "full_policy_sync_clock", "validate_full_policy_sync_clock"]
+        definitions(ROOT / "verl_omni/utils/full_policy_sync.py", clock_names, namespace)
+        sys.modules["verl_omni.utils.full_policy_sync"] = SimpleNamespace(
+            **{name: namespace[name] for name in clock_names})
 
         class Parent:
             async def set_global_steps(self, value):
@@ -98,6 +102,7 @@ def run_rank(rank, rendezvous):
         server_class = definitions(ROOT / "verl_omni/workers/rollout/vllm_rollout/vllm_omni_async_server.py",
                                    ["set_global_steps"], namespace, "Server", Parent)
         os.environ["OMNI_FULL_FINETUNE"] = "1"
+        os.environ["OMNI_VARIANT"] = "ART_FULL32"
         outcomes = []
         for scenario in ("old_rank_local_reply", "healthy_gathered_reply", "peer_not_ready", "peer_wrong_version",
                          "duplicate_physical_identity", "peer_local_exception"):
@@ -111,6 +116,7 @@ def run_rank(rank, rendezvous):
             extension._full_weight_sync_valid = not (scenario == "peer_not_ready" and rank == 1)
             version = 0 if scenario == "peer_wrong_version" and rank == 1 else 2
             extension._full_committed_state = {
+                "policy_algorithm": "diffusion_art", "optimizer_updates_per_rollout": 2,
                 "policy_version": version, "global_steps": version // 2, "post_load_checks": 4186,
                 "buckets": 19, "source_tensors": {"cpu-fixture": {}}, "loaded_targets": ["cpu-fixture"],
                 "checked_kinds": ["packed_q", "packed_k", "packed_v"]}

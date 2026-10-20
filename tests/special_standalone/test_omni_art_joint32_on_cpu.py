@@ -229,8 +229,8 @@ class LaunchTests(unittest.TestCase):
                 shim.write_text(
                     'source() { case "$1" in */my_bashrc.sh|*/runtime_env.sh|*/use_source_snapshot.sh) '
                     'return 0;; *) builtin source "$@";; esac; }\n'
-                    'python() { if [[ "$1" == */transport.py && "$2" == hydra ]]; then '
-                    'echo \'++ray_kwargs.ray_init.runtime_env.env_vars.NCCL_NET="NCCL RDMA Plugin v9"\'; '
+                    'python() { if [[ "$1" == */transport.py && "${2:-}" == hydra ]]; then '
+                    'printf "%s\\n" "++ray_kwargs.ray_init.runtime_env.env_vars.NCCL_ALGO=Ring"; '
                     'else command python "$@"; fi; }\n'
                 )
                 python = root / "bin/python3"

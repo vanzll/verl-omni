@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Runs inside the generation-fenced owner's one child process group.
-set -euo pipefail
+set -eo pipefail
 source /m2v_intern2/zhenglin/my_bashrc.sh
+set -u
 
 campaign=${OMNI_RUNTIME_ROOT:?}
 control=${OMNI_CONTROL_DIR:?}
@@ -28,6 +29,11 @@ export TMPDIR="$RAY_TMPDIR"
 # No capacity floor is enforced; Ray's percentage heuristic
 # would reject spilling even with hundreds of GiB available to this campaign.
 export RAY_local_fs_capacity_threshold=1.0
+if [[ "${OMNI_VARIANT:-}" == NFT_FULL32_U* ]]; then
+    source "$control/nft_cache_env.sh"
+    export RAY_ROTATION_MAX_BYTES=67108864
+    export RAY_ROTATION_BACKUP_COUNT=2
+fi
 mkdir -p "$OUTPUT_DIR/logs" "$RAY_TMPDIR" "$TMPDIR"
 timeout --foreground 30 python "$control/transport.py" topology \
     > "$OUTPUT_DIR/logs/transport_topology_$(hostname -s).json"
@@ -98,7 +104,21 @@ if [[ "$OMNI_ROLE" == head ]]; then
     OMNI_GPU_RESERVATION_START_UNIX_MEAN=$(python "$control/record_gpu_reservation.py" mean-start)
     echo "[$(date -u +%FT%TZ)] allocation ready; launching $OMNI_VARIANT"
     timeout --foreground 240 python "$control/gate32.py" collective
-    bash "$SOURCE_CHECKOUT_DIR/examples/diffusionart_trainer/ltx2/run_ltx2_t2av_art_joint32.sh"
+    case "$OMNI_VARIANT" in
+        NFT_FULL32_U1)
+            bash "$SOURCE_CHECKOUT_DIR/examples/omninft_trainer/ltx2/run_ltx2_t2av_nft_full32_u1.sh"
+            ;;
+        NFT_FULL32_U2)
+            bash "$SOURCE_CHECKOUT_DIR/examples/omninft_trainer/ltx2/run_ltx2_t2av_nft_full32_u2.sh"
+            ;;
+        ART_FULL32_ROUTED)
+            bash "$SOURCE_CHECKOUT_DIR/examples/diffusionart_trainer/ltx2/run_ltx2_t2av_art_routed_full32.sh"
+            ;;
+        ART_FULL32|A12JOINT32)
+            bash "$SOURCE_CHECKOUT_DIR/examples/diffusionart_trainer/ltx2/run_ltx2_t2av_art_joint32.sh"
+            ;;
+        *) echo "Unsupported training variant: $OMNI_VARIANT" >&2; exit 2 ;;
+    esac
 
 else
     wait_for_head_port

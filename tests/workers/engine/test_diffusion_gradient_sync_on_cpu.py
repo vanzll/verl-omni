@@ -41,6 +41,7 @@ class _FSDP2Module:
 
 def _engine(monkeypatch):
     engine = object.__new__(diffusers_impl.PPODiffusersFSDPEngine)
+    engine.model_config = SimpleNamespace(full_finetune=False)
     engine.ulysses_sequence_parallel_size = 1
     engine.get_data_parallel_group = lambda: None
     engine.postprocess_batch_func = lambda output_lst, indices, data: output_lst
@@ -106,6 +107,7 @@ def test_forward_only_never_enters_sync_context(monkeypatch):
 
 def test_gradient_sync_context_delegates_fsdp2(monkeypatch):
     engine = object.__new__(diffusers_impl.PPODiffusersFSDPEngine)
+    engine.model_config = SimpleNamespace(full_finetune=False)
     engine.module = _FSDP2Module()
     monkeypatch.setattr("verl.workers.engine.fsdp.transformer_impl.fsdp_version", lambda _: 2)
 
@@ -117,6 +119,7 @@ def test_gradient_sync_context_delegates_fsdp2(monkeypatch):
 
 def test_gradient_sync_context_restores_fsdp2_after_error(monkeypatch):
     engine = object.__new__(diffusers_impl.PPODiffusersFSDPEngine)
+    engine.model_config = SimpleNamespace(full_finetune=False)
     engine.module = _FSDP2Module()
     monkeypatch.setattr("verl.workers.engine.fsdp.transformer_impl.fsdp_version", lambda _: 2)
 
@@ -129,6 +132,7 @@ def test_gradient_sync_context_restores_fsdp2_after_error(monkeypatch):
 
 def test_gradient_sync_context_keeps_sync_on_last_step(monkeypatch):
     engine = object.__new__(diffusers_impl.PPODiffusersFSDPEngine)
+    engine.model_config = SimpleNamespace(full_finetune=False)
     engine.module = _FSDP2Module()
     monkeypatch.setattr("verl.workers.engine.fsdp.transformer_impl.fsdp_version", lambda _: 2)
 

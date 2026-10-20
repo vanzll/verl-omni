@@ -33,6 +33,59 @@ def records():
 
 
 class Full32GateTests(unittest.TestCase):
+    def test_nft_requires_one_actual_update_and_distinct_frozen_ema(self):
+        actual = records()
+        for record in actual:
+            actor = record["actor"]
+            actor.update(policy_version=1, old_version=1, export_version=1,
+                         policy_kind="nft_current_and_frozen_ema", ema_frozen_nonaliasing=True,
+                         ema_updates=1, ema_policy_version=1, optimizer_updates_per_rollout=1,
+                         ema_parameter_tensors=4, ema_global_parameter_numel=64,
+                         ema_local_parameter_numel=2, base_reference_constructed=False)
+            actor["recent_updates"] = actor["recent_updates"][:1]
+            if record["rollout"]:
+                for receiver in record["rollout"][0]:
+                    receiver["state"].update(policy_version=1, policy_algorithm="omni_nft",
+                                             optimizer_updates_per_rollout=1)
+        evidence = GATE.validate_full32_gate(actual, expected_parameters=64, expected_tensors=4)
+        self.assertIn("nft_u1", evidence["status"])
+        for key, value in (("ema_frozen_nonaliasing", False), ("ema_updates", 0),
+                           ("base_reference_constructed", True), ("ema_local_parameter_numel", 64)):
+            broken = copy.deepcopy(actual)
+            broken[0]["actor"][key] = value
+            with self.assertRaises(RuntimeError):
+                GATE.validate_full32_gate(broken, expected_parameters=64, expected_tensors=4)
+
+    def test_nft_u2_requires_two_real_steps_but_one_ema_refresh(self):
+        actual = records()
+        for record in actual:
+            record["actor"].update(
+                policy_kind="nft_current_and_frozen_ema", ema_frozen_nonaliasing=True,
+                ema_updates=1, ema_policy_version=2, optimizer_updates_per_rollout=2,
+                ema_parameter_tensors=4, ema_global_parameter_numel=64,
+                ema_local_parameter_numel=2, base_reference_constructed=False,
+            )
+            if record["rollout"]:
+                for receiver in record["rollout"][0]:
+                    receiver["state"].update(policy_algorithm="omni_nft", optimizer_updates_per_rollout=2)
+        evidence = GATE.validate_full32_gate(actual, expected_parameters=64, expected_tensors=4)
+        self.assertIn("nft_u2", evidence["status"])
+        for key, value in (("ema_updates", 2), ("ema_policy_version", 1),
+                           ("optimizer_updates_per_rollout", 1), ("policy_kind", "art"),
+                           ("recent_updates", [{"policy_version": 2, "global_preclip_norm": 0.4}])):
+            with self.subTest(actor_field=key):
+                broken = copy.deepcopy(actual)
+                broken[0]["actor"][key] = value
+                with self.assertRaises(RuntimeError):
+                    GATE.validate_full32_gate(broken, expected_parameters=64, expected_tensors=4)
+        for key, value in (("policy_algorithm", "diffusion_art"), ("optimizer_updates_per_rollout", 1),
+                           ("policy_version", 1)):
+            with self.subTest(native_field=key):
+                broken = copy.deepcopy(actual)
+                broken[0]["rollout"][0][0]["state"][key] = value
+                with self.assertRaises(RuntimeError):
+                    GATE.validate_full32_gate(broken, expected_parameters=64, expected_tensors=4)
+
     def test_complete_native_two_update_gate(self):
         evidence = GATE.validate_full32_gate(records(), expected_parameters=64, expected_tensors=4)
         self.assertEqual(len(evidence["actors"]), 32)

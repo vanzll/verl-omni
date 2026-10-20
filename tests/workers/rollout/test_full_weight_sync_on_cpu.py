@@ -64,6 +64,7 @@ class FullWeightSyncTests(unittest.TestCase):
         self.weights = {f"transformer.{name}": torch.full((2, 2), float(index + 1))
                         for index, name in enumerate(("query", "key", "value", "dense"))}
         self.metadata = {"policy_version": 2, "global_steps": 1,
+                         "policy_algorithm": "diffusion_art", "optimizer_updates_per_rollout": 2,
                          "tensors": {name: {"shape": list(tensor.shape), "dtype": str(tensor.dtype)}
                                      for name, tensor in self.weights.items()},
                          "sample_names": list(self.weights)}
@@ -179,9 +180,10 @@ class FullWeightSyncTests(unittest.TestCase):
 
         server.collective_rpc = rpc
         good = {"ready": True, "hostname": "host", "physical_gpu": "0", "native_rank": 0,
-                "native_world_size": 2, "state": {"policy_version": 2, "global_steps": 1}}
+                "native_world_size": 2, "state": {"policy_version": 2, "global_steps": 1,
+                "policy_algorithm": "diffusion_art", "optimizer_updates_per_rollout": 2}}
         peer = dict(good, physical_gpu="1", native_rank=1)
-        with patch.dict(os.environ, {"OMNI_FULL_FINETUNE": "1"}), patch.dict(sys.modules, {
+        with patch.dict(os.environ, {"OMNI_FULL_FINETUNE": "1", "OMNI_VARIANT": "ART_FULL32"}), patch.dict(sys.modules, {
             "verl_omni.workers.rollout.vllm_rollout.full_weight_sync": SYNC,
         }):
             for replies in ([good], [[good]], [good, good], [[good, peer]], [[[good]]],

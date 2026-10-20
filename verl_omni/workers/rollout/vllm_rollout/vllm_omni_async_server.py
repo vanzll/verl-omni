@@ -389,18 +389,22 @@ class vLLMOmniHttpServer(vLLMHttpServer):
 
     async def set_global_steps(self, global_steps: int):
         if os.environ.get("OMNI_FULL_FINETUNE") == "1":
+            from verl_omni.utils.full_policy_sync import full_policy_sync_clock, validate_full_policy_sync_clock
             from verl_omni.workers.rollout.vllm_rollout.full_weight_sync import unpack_full_policy_sync_replies
 
             replies = await self.collective_rpc(method="get_full_policy_sync_state")
-            expected = {"policy_version": 2 * global_steps, "global_steps": global_steps}
+            nft = os.environ.get("OMNI_VARIANT", "").startswith("NFT_FULL32_")
+            expected = full_policy_sync_clock(global_steps, nft=nft)
             ranks = unpack_full_policy_sync_replies(replies, get_rollout_world_size(self.config))
             for reply in ranks:
                 if not isinstance(reply, dict) or reply.get("ready") is not True or not isinstance(reply.get("state"), dict):
                     raise RuntimeError("Full native rollout has an incomplete weight transaction.")
                 if reply.get("error") or reply.get("supported") is False:
                     raise RuntimeError("Full native rollout rejected the policy transaction.")
-                if any(reply["state"].get(key) != value for key, value in expected.items()):
-                    raise RuntimeError("Full native rollout committed the wrong policy version.")
+                try:
+                    validate_full_policy_sync_clock(reply["state"], nft=nft, global_steps=global_steps)
+                except ValueError as error:
+                    raise RuntimeError("Full native rollout committed the wrong policy version or algorithm.") from error
             self._full_committed_policy_version = expected["policy_version"]
         if global_steps != self.global_steps:
             self._invalidate_lora_request_cache()
@@ -653,7 +657,9 @@ class vLLMOmniServerAdapter(ServerAdapter):
         if wire_format != "named_tensors" or global_steps is None:
             raise ValueError("Full ART requires versioned named-tensor synchronization.")
         from verl_omni.utils.full_weight_transfer import FullBoundedWeightSender
+        from verl_omni.utils.full_policy_sync import full_policy_sync_clock
 
+        clock = full_policy_sync_clock(global_steps, nft=os.environ.get("OMNI_VARIANT", "").startswith("NFT_FULL32_"))
         deadline = float(os.environ.get("VLLM_OMNI_DLO_DP_WAVE_TIMEOUT", "3600"))
         future = await self._execute_method(
             "update_weights_from_ipc", non_block=True, timeout=deadline,
@@ -662,7 +668,7 @@ class vLLMOmniServerAdapter(ServerAdapter):
         sender = FullBoundedWeightSender(
             zmq_handle=self.zmq_handle,
             bucket_size_mb=self.config.checkpoint_engine.update_weights_bucket_megabytes,
-            use_shm=self.use_shm, receiver_future=future, policy_version=2 * global_steps,
+            use_shm=self.use_shm, receiver_future=future, policy_version=clock["policy_version"],
         )
         await sender.async_send_weights(weights)
         if future is not None:
@@ -679,9 +685,11 @@ class vLLMOmniServerAdapter(ServerAdapter):
         args: tuple = (),
         kwargs: Optional[dict] = None,
     ):
-        """Require checked replies for IPC weight updates through the inherited sender."""
-        if method != "update_weights_from_ipc":
+        """Require checked replies before and during Full-policy IPC weight updates."""
+        if method not in ("update_weights_from_ipc", "set_full_policy_sync_metadata"):
             return await super()._execute_method(method, non_block=non_block, timeout=timeout, args=args, kwargs=kwargs)
+        if method == "set_full_policy_sync_metadata" and timeout is None:
+            timeout = float(os.environ.get("VLLM_OMNI_DLO_DP_WAVE_TIMEOUT", "3600"))
         if not self._ensure_server_handle():
             return None
         future = self.server_handle.collective_rpc.remote(

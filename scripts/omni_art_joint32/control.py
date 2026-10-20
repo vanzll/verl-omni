@@ -64,15 +64,33 @@ def choose_service_ports():
     raise RuntimeError("No free disjoint Ray and collective service ports found")
 
 
-def batch_contract(micro, full=False):
-    if micro not in (1, 2, 4):
-        raise ValueError("update microbatch must be 1, 2 or 4")
-    return {"prompts": 32, "K": 8, "rollout_samples": 256, "update_samples": 128,
-            "updates_per_rollout": 2, "DP": 32, "SP": 1, "fsdp_size": 32 if full else 1,
-            "update_microbatch": micro, "gradient_accumulation": 4 // micro,
+def launch_recipe(variant="art"):
+    if variant in ("nft_full32_u1", "nft_full32_u2"):
+        return Path(f"examples/omninft_trainer/ltx2/run_ltx2_t2av_{variant}.sh")
+    if variant == "art_full32_routed":
+        return Path("examples/diffusionart_trainer/ltx2/run_ltx2_t2av_art_routed_full32.sh")
+    if variant == "art":
+        return Path("examples/diffusionart_trainer/ltx2/run_ltx2_t2av_art_joint32.sh")
+    raise ValueError("unsupported launch variant: " + variant)
+
+def batch_contract(micro, full=False, variant="art"):
+    launch_recipe(variant)
+    nft = variant in ("nft_full32_u1", "nft_full32_u2")
+    u1 = variant == "nft_full32_u1"
+    if micro not in ((1, 2, 4, 8) if u1 else (1, 2, 4)):
+        raise ValueError("unsupported update microbatch for " + variant)
+    local_samples = 8 if u1 else 4
+    contract = {"prompts": 32, "K": 8, "rollout_samples": 256, "update_samples": 256 if u1 else 128,
+            "updates_per_rollout": 1 if u1 else 2, "DP": 32, "SP": 1, "fsdp_size": 32 if full or nft or variant == "art_full32_routed" else 1,
+            "update_microbatch": micro, "gradient_accumulation": local_samples // micro,
             "infer_microbatch": 2, "rollout_TP": 2, "rollout_agent_workers": 16,
             "baseline_rollout_agent_workers": 8, "target_updates": None, "target_rollouts": None,
             "run_until_stopped": True}
+    if nft:
+        contract.update(global_minibatch_prompts=32 if u1 else 16, expanded_global_minibatch=256 if u1 else 128,
+                        local_update_samples=local_samples, training_timesteps=20,
+                        policy_states=["current", "ema_old"], base_reference=False)
+    return contract
 
 def allocation():
     rows = [line.split() for line in Path("/etc/mpi/hostfile").read_text().splitlines()
@@ -128,9 +146,19 @@ def verify_source():
     if digest(manifest) != os.environ["SOURCE_FILES_MANIFEST_SHA256"]:
         raise RuntimeError("source manifest digest mismatch")
     files = json.loads(manifest.read_text())
-    required = {"scripts/omni_art_joint32/control.py",
-                "examples/diffusionart_trainer/ltx2/run_ltx2_t2av_art_joint32.sh",
-                "verl_omni/trainer/diffusion/diffusion_art.py"}
+    variant = os.environ.get("OMNI_VARIANT", "A12JOINT32")
+    if variant not in ("A12JOINT32", "ART_FULL32", "ART_FULL32_ROUTED", "NFT_FULL32_U1", "NFT_FULL32_U2"):
+        raise RuntimeError("unsupported source variant")
+    required = {"scripts/omni_art_joint32/control.py"}
+    if variant in ("NFT_FULL32_U1", "NFT_FULL32_U2"):
+        required.update({str(launch_recipe(variant.lower())),
+                         "examples/omninft_trainer/ltx2/ltx2_omninft.yaml",
+                         "verl_omni/trainer/diffusion/diffusion_algos.py",
+                         "verl_omni/workers/engine/full_policy.py",
+                         "verl_omni/workers/engine/full_nft_policy.py",
+                         "verl_omni/pipelines/ltx2_omni_nft/config.py"})
+    else:
+        required.update({str(launch_recipe()), "verl_omni/trainer/diffusion/diffusion_art.py"})
     if not required <= set(files):
         raise RuntimeError("source manifest is incomplete")
     for name, expected in files.items():
@@ -174,6 +202,16 @@ def pinned(manifest):
             raise RuntimeError("node descriptor changed")
 
 def prepare(args):
+    variant = getattr(args, "variant", "art")
+    nft = variant in ("nft_full32_u1", "nft_full32_u2")
+    full = bool(getattr(args, "full_finetune", False)) or nft or variant == "art_full32_routed"
+    contract = batch_contract(args.update_microbatch, full=full, variant=variant)
+    recipe = launch_recipe(variant)
+    extension = "nft_full32" if nft else "art_joint32"
+    args.runtime_root = args.runtime_root or CAMPAIGN / "extensions" / extension
+    args.fallback_runtime_root = args.fallback_runtime_root or Path(
+        "/m2v_intern2/zhenglin/omni_art_ablation_20261016/extensions") / extension
+    node_variant = variant.upper() if variant != "art" else ("ART_FULL32" if full else "A12JOINT32")
     allocation()
     incident = json.loads(args.incident_review.read_text())
     if incident.get("status") != "reviewed" or not incident.get("evidence_paths") or not incident.get("notes"):
@@ -182,10 +220,13 @@ def prepare(args):
         if not Path(path).is_absolute() or not Path(path).is_file():
             raise RuntimeError("incident evidence path missing")
     source = args.source_root.resolve()
-    if not source.is_relative_to(CAMPAIGN / "extensions/art_joint32") or CONTROL != source / "scripts/omni_art_joint32":
-        raise RuntimeError("deploy the new controls/source under campaign/extensions/art_joint32 first")
+    if (not any(source.is_relative_to(root) for root in (
+                CAMPAIGN / "extensions" / extension,
+                Path("/m2v_intern2/zhenglin/omni_art_ablation_20261016/extensions") / extension))
+            or CONTROL != source / "scripts/omni_art_joint32"):
+        raise RuntimeError("deploy the new controls/source under campaign/extensions/" + extension + " first")
     env = dict(os.environ, SOURCE_CHECKOUT_DIR=str(source), SOURCE_FILES_MANIFEST=str(args.source_manifest),
-               SOURCE_FILES_MANIFEST_SHA256=args.source_manifest_sha256)
+               SOURCE_FILES_MANIFEST_SHA256=args.source_manifest_sha256, OMNI_VARIANT=node_variant)
     subprocess.run([sys.executable, str(CONTROL / "control.py"), "verify-source"], env=env, check=True, timeout=120)
     for path, expected in [(CAMPAIGN / "assets/vggsound/parquet/train.parquet", TRAIN_SHA),
                            (CAMPAIGN / "assets/vggsound/parquet/test8.parquet", VAL_SHA)]:
@@ -197,13 +238,18 @@ def prepare(args):
     if len({row["hostname"] for row in audits}) != 4 or socket.gethostname().split(".")[0] != audits[0]["hostname"]:
         raise RuntimeError("prepare/start must run on the allocated head, not developer remote")
     for root in (args.runtime_root, args.fallback_runtime_root):
-        if not any(root.is_relative_to(Path(base) / "omni_art_ablation_20261016/extensions/art_joint32")
-                   for base in ("/m2v_intern/zhenglin", "/m2v_intern2/zhenglin")):
+        if not any(root.resolve().is_relative_to(base) for base in (
+            CAMPAIGN / "extensions" / extension,
+            Path("/m2v_intern2/zhenglin/omni_art_ablation_20261016/extensions") / extension,
+        )):
             raise RuntimeError("write root must be an authorized isolated extension")
     runtime = choose_runtime(args.runtime_root, args.fallback_runtime_root)
-    full = bool(getattr(args, "full_finetune", False))
-    prefix = "LTX23-ART-A12-FULL32-P32K8-U2-S42-" if full else "LTX23-A12JOINT32-P32K8-UNBOUNDED-S42-"
-    prefix += "RDMA-RingSimple-"
+    prefix = f"LTX23-OMNINFT-NOKL-FULL32-U{contract['updates_per_rollout']}-PROMPTSTD-P32K8-S42-" if nft else (
+        "LTX23-ART-A12-FULL32-P32K8-U2-S42-" if full else "LTX23-A12JOINT32-P32K8-UNBOUNDED-S42-")
+    if variant == "art_full32_routed":
+        prefix = "LTX23-ART-ROUTED20-FULL32-P32K8-U2-S42-"
+    if not nft:
+        prefix += "RDMA-RingSimple-"
     run = prefix + time.strftime("%Y%m%dT%H%M%S") + "-" + secrets.token_hex(3)
     output = runtime / "attempts" / run
     for directory in ("logs", "nodes", "provenance"):
@@ -214,8 +260,17 @@ def prepare(args):
     launch_files += [CAMPAIGN / "scripts" / name for name in (
         "gpu_lease_lib.sh", "runtime_env.sh", "check_assets.py", "inspect_gpu_node.py")]
     launch_files += [CAMPAIGN / "bin/gpu_free", CAMPAIGN / "bin/gpu_hold"]
-    launch_files += [args.source_manifest, args.incident_review, source / "examples/diffusionart_trainer/ltx2/run_ltx2_t2av_art_lora.sh",
-                     source / "examples/diffusionart_trainer/ltx2/run_ltx2_t2av_art_joint32.sh"]
+    launch_files += [args.source_manifest, args.incident_review, source / recipe]
+    launch_files += [source / ("examples/omninft_trainer/ltx2/ltx2_omninft.yaml" if nft else
+                             "examples/diffusionart_trainer/ltx2/run_ltx2_t2av_art_lora.sh")]
+    validation_args = []
+    if nft:
+        anchors = CAMPAIGN / "extensions/nft_full32/baseline_wandb"
+        baseline_config = anchors / "f07cd5db/config.json"
+        infra_config = anchors / "266a1574205eda99/config.json"
+        launch_files += [baseline_config, infra_config]
+        validation_args = ["--nft-baseline", str(baseline_config), "--infra-baseline", str(infra_config),
+                           "--report", str(output / "provenance/nft-config-diff.json")]
     launch = output / "provenance/launch-files.json"
     atomic(launch, {str(path): digest(path) for path in launch_files})
     launch_sha = digest(launch)
@@ -245,10 +300,10 @@ def prepare(args):
                       OMNI_RAY_PORT=ray_port, OMNI_RAY_OBJECT_STORE_BYTES=OBJECT_STORE,
                       RAY_ADDRESS=f"{next(iter(PORTS))}:{ray_port}",
                       OMNI_NODE_DESCRIPTOR=str(descriptor), OMNI_LAUNCH_MANIFEST_SHA256=launch_sha,
-                      OMNI_VARIANT="ART_FULL32" if full else "A12JOINT32", OMNI_FULL_FINETUNE=int(full),
+                      OMNI_VARIANT=node_variant, OMNI_FULL_FINETUNE=int(full),
                       RUN_NAME=run, OUTPUT_DIR=str(output),
                       WANDB_RUN_ID=run_id, WANDB_RESUME="never", WANDB_MODE="online", WANDB_ENTITY=args.wandb_entity,
-                      OMNI_UPDATE_MICROBATCH=args.update_microbatch, OMNI_ART_CACHE_ACCEPTANCE="1")
+                      OMNI_UPDATE_MICROBATCH=args.update_microbatch, OMNI_ART_CACHE_ACCEPTANCE="0" if nft else "1")
         for key, directory in {
             "XDG_CONFIG_HOME": "config", "WANDB_CONFIG_DIR": "wandb_config", "WANDB_CACHE_DIR": "wandb_cache",
             "WANDB_DATA_DIR": "wandb_data", "CUPY_CACHE_DIR": "cupy", "NUMBA_CACHE_DIR": "numba",
@@ -266,19 +321,20 @@ def prepare(args):
                 "source_root": str(source), "source_manifest": str(args.source_manifest),
                 "source_manifest_sha256": args.source_manifest_sha256, "source_archive_sha256": args.source_archive_sha256,
                 "nodes": nodes, "launch_manifest": str(launch), "launch_manifest_sha256": launch_sha,
-                "contract": batch_contract(args.update_microbatch, full=full), "wandb_run_id": run_id,
+                "variant": variant, "launch_recipe": str(recipe), "contract": contract, "wandb_run_id": run_id,
                 "checkpoint_writes": False, "resume": False, "collective_port": collective_port,
                 "gpu_validation": "pending_actual_gate32", "incident_review": str(args.incident_review)}
     atomic(output / "manifest.json", manifest)
     # Resolve the actual new source, not a copied world16 schema certificate.
     config_command = 'source /m2v_intern2/zhenglin/my_bashrc.sh\nsource "$1"\nexport OMNI_CONFIG_ONLY=1 OMNI_CONFIG_OUTPUT="$3"\nexec bash "$2"'
     resolved = subprocess.run(["bash", "-c", config_command, "a3-config", nodes[0]["env_file"],
-        str(source / "examples/diffusionart_trainer/ltx2/run_ltx2_t2av_art_joint32.sh"),
+        str(source / recipe),
         str(output / "provenance/resolved.yaml")],
         check=True, text=True, capture_output=True, timeout=120)
     (output / "logs/config_resolution.log").write_text(resolved.stdout + resolved.stderr)
     subprocess.run([str(CAMPAIGN / "env/bin/python"), str(CONTROL / "validate_config.py"),
-                    str(output / "provenance/resolved.yaml"), str(args.update_microbatch)], check=True, timeout=30)
+                    str(output / "provenance/resolved.yaml"), str(args.update_microbatch), variant,
+                    *validation_args], check=True, timeout=30)
     atomic(output / "prepared.json", {"status": "prepared_cpu_config_only", "manifest_sha256": digest(output / "manifest.json"),
                                      "resolved_sha256": digest(output / "provenance/resolved.yaml")})
     print(json.dumps({"manifest": str(output / "manifest.json"), "actual_write_root": str(runtime),
@@ -416,10 +472,10 @@ def main():
         parser.add_argument("--source-archive-sha256", required=True)
         parser.add_argument("--incident-review", type=Path, required=True)
         parser.add_argument("--wandb-entity", required=True)
-        parser.add_argument("--runtime-root", type=Path, default=CAMPAIGN / "extensions/art_joint32")
-        parser.add_argument("--fallback-runtime-root", type=Path,
-                            default=Path("/m2v_intern2/zhenglin/omni_art_ablation_20261016/extensions/art_joint32"))
-        parser.add_argument("--update-microbatch", type=int, choices=(1, 2, 4), default=4)
+        parser.add_argument("--variant", choices=("art", "nft_full32_u1", "nft_full32_u2", "art_full32_routed"), default="art")
+        parser.add_argument("--runtime-root", type=Path)
+        parser.add_argument("--fallback-runtime-root", type=Path)
+        parser.add_argument("--update-microbatch", type=int, choices=(1, 2, 4, 8), default=4)
         parser.add_argument("--full-finetune", action="store_true")
         prepare(parser.parse_args(sys.argv[2:]))
     else:

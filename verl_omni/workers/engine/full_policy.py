@@ -193,10 +193,27 @@ class FullPolicyMixin:
         window = self._full_policy_version - self._full_old_version
         if window not in (0, 1) or not bool((versions == self._full_old_version).all()):
             raise ValueError("Full cached old target does not match the frozen rollout boundary.")
-        if not bool((windows == window).all()) or data[timesteps_key].shape[1] != 19:
-            raise ValueError("Full cached ART requires the expected window and all 19 training timesteps.")
+        counts = data.get("art_train_step_count")
+        if counts is not None and (counts.shape != versions.shape or counts.dtype != torch.int64):
+            raise ValueError("Full cached ART requires an int64 timestep count per trajectory.")
+        expected_steps = 19 if counts is None else int(counts.reshape(-1)[0])
+        if counts is not None and not bool((counts == expected_steps).all()):
+            raise ValueError("Full cached ART requires one consistent configured timestep count.")
+        if (
+            not bool((windows == window).all())
+            or expected_steps not in (19, 20)
+            or data[timesteps_key].shape[1] != expected_steps
+        ):
+            raise ValueError("Full cached ART requires the expected window and all configured 19 or 20 timesteps.")
+        if counts is not None:
+            rollout_times = data.get("all_timesteps")
+            if rollout_times is None or rollout_times.shape != (len(versions), 20):
+                raise ValueError("Full cached ART requires the original 20-position rollout time grid.")
+            expected_times = rollout_times[:, :expected_steps].sort(dim=1).values
+            if not torch.equal(data[timesteps_key].sort(dim=1).values, expected_times):
+                raise ValueError("Full cached ART training positions do not match the configured rollout time grid.")
         self._full_event("cached_window", update_window=window, cache_version=int(versions.reshape(-1)[0]),
-                         samples=len(versions), training_timesteps=19)
+                         samples=len(versions), training_timesteps=expected_steps)
 
     def _full_step_applied(self, before, grad_norm):
         names, previous = before

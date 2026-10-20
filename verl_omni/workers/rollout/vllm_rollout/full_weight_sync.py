@@ -172,6 +172,9 @@ class FullWeightCoverage:
         if not self.post_load_checks:
             raise RuntimeError("No post-load Full transformer weights were independently checked.")
         return {"policy_version": self.metadata["policy_version"], "global_steps": self.metadata["global_steps"],
+                **{key: self.metadata[key] for key in (
+                    "policy_algorithm", "optimizer_updates_per_rollout"
+                ) if key in self.metadata},
                 "source_tensors": self.source, "loaded_targets": sorted(self.loaded),
                 "qkv_parts": {name: sorted(parts, key=str) for name, parts in self.parts.items()},
                 "source_samples": self.samples, "post_load_checks": self.post_load_checks,

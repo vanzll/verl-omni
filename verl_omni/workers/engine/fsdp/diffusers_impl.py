@@ -14,6 +14,7 @@
 """FSDP engines for diffusion models."""
 
 import gc
+import copy
 import json
 import logging
 import os
@@ -73,7 +74,8 @@ from verl_omni.utils.diffusion_compile import _maybe_compile_repeated_blocks
 from verl_omni.utils.fsdp_utils import apply_fsdp2, collect_lora_params
 from verl_omni.workers.config import DiffusionModelConfig
 from verl_omni.workers.engine.lora_adapter_mixin import LoRAAdapterMixin
-from verl_omni.workers.engine.full_policy import FullPolicyMixin, parameter_ownership
+from verl_omni.workers.engine.full_policy import parameter_ownership
+from verl_omni.workers.engine.full_nft_policy import FullNFTPolicyMixin
 from verl_omni.utils.tensor_audit import tensor_sample
 
 logger = logging.getLogger(__file__)
@@ -147,7 +149,7 @@ def _fsdp_param_dtype(
     return configured_dtype
 
 
-class DiffusersFSDPEngine(FullPolicyMixin, LoRAAdapterMixin, BaseEngine, ABC):
+class DiffusersFSDPEngine(FullNFTPolicyMixin, LoRAAdapterMixin, BaseEngine, ABC):
     """Base Diffusers engine using PyTorch FullyShardedDataParallel (FSDP).
 
     Supports model sharding, activation/optimizer offloading, LoRA, and sequence parallelism.
@@ -573,6 +575,8 @@ class DiffusersFSDPEngine(FullPolicyMixin, LoRAAdapterMixin, BaseEngine, ABC):
         # compiled regional forward/backward.
         _maybe_compile_repeated_blocks(module, self.model_config, self.engine_config)
 
+        old_module = copy.deepcopy(module).requires_grad_(False) if self.full_nft else None
+
         # Load diffusion scheduler
         scheduler = self._build_scheduler()
 
@@ -600,6 +604,10 @@ class DiffusersFSDPEngine(FullPolicyMixin, LoRAAdapterMixin, BaseEngine, ABC):
         self.scheduler = scheduler
         self.optimizer = optimizer
         self.lr_scheduler = lr_scheduler
+        if self.full_nft:
+            self._nft_old_module = self._build_fsdp_module(old_module)
+            self._nft_old_module.requires_grad_(False)
+            self._full_event("nft_ema_initialized", **self._nft_policy_summary())
         if self.full_finetune:
             self._assert_full_runtime_sharding()
             ownership = parameter_ownership(self.module, self.optimizer)
@@ -831,6 +839,12 @@ class DiffusersFSDPEngine(FullPolicyMixin, LoRAAdapterMixin, BaseEngine, ABC):
         else:
             raise ValueError(f"Invalid device type: {device}")
 
+        if model and self.full_nft and self._nft_old_module is not None:
+            if device == device_name:
+                load_fsdp_model_to_gpu(self._nft_old_module)
+            else:
+                offload_fsdp_model_to_cpu(self._nft_old_module)
+
     def save_checkpoint(
         self,
         local_path: str,
@@ -884,11 +898,15 @@ class DiffusersFSDPEngine(FullPolicyMixin, LoRAAdapterMixin, BaseEngine, ABC):
     ):
         """Export the transformer weights for a rollout-engine weight sync."""
         if self.full_finetune:
+            from verl_omni.utils.full_policy_sync import full_policy_sync_tag
+
             version = self._full_export_version(adapter_name)
-            params = convert_weight_keys(self.module.state_dict(), self.module)
+            export_module = self._nft_old_module if getattr(self, "full_nft", False) else self.module
+            params = convert_weight_keys(export_module.state_dict(), export_module)
             names = list(params)
             sample_names = names[::max(1, len(names) // 16)]
             self._full_sync_metadata = {
+                **full_policy_sync_tag(self.model_config.algorithm),
                 "policy_version": version,
                 "tensors": {f"transformer.{name}": {"shape": list(parameter.shape), "dtype": str(parameter.dtype)}
                             for name, parameter in params.items()},
@@ -1767,7 +1785,7 @@ class OmniNFTDiffusersFSDPEngine(NFTDiffusersFSDPEngine):
         old, current, reference, x0, xt, flow_time = output
         video_old, audio_old = old
         video_current, audio_current = current
-        video_reference, audio_reference = reference
+        video_reference, audio_reference = reference if reference is not None else (None, None)
         video_x0, audio_x0 = x0
         video_xt, audio_xt = xt
         video_t, audio_t = flow_time
@@ -1788,11 +1806,24 @@ class OmniNFTDiffusersFSDPEngine(NFTDiffusersFSDPEngine):
 
     def forward_step(self, micro_batch: TensorDict, loss_function, forward_only, step):
         model_inputs, negative_model_inputs, x0, xt, flow_time = self.prepare_model_inputs(micro_batch, step)
-        with self.use_adapter("old"), torch.no_grad():
+        loss_config = getattr(loss_function, "keywords", {}).get("config")
+        reference_enabled = True
+        if loss_config is not None:
+            reference_enabled = bool(loss_config.use_kl_loss) or any(
+                float(loss_config.diffusion_loss.get(name, 0.0)) != 0.0
+                for name in ("ref_kl_coef", "video_ref_kl_coef", "audio_ref_kl_coef")
+            )
+        if self.full_nft and reference_enabled:
+            raise ValueError("Full NFT currently requires all reference coefficients zero and use_kl_loss=false.")
+        old_module = self._nft_old_module if self.full_nft else self.module
+        if self.full_nft:
+            old_module.train(self.module.training)
+        old_context = nullcontext() if self.full_nft else self.use_adapter("old")
+        with old_context, torch.no_grad():
             old_prediction = tuple(
                 prediction.detach()
                 for prediction in forward(
-                    module=self.module,
+                    module=old_module,
                     model_config=self.model_config,
                     model_inputs=model_inputs,
                     negative_model_inputs=negative_model_inputs,
@@ -1804,17 +1835,36 @@ class OmniNFTDiffusersFSDPEngine(NFTDiffusersFSDPEngine):
             model_inputs=model_inputs,
             negative_model_inputs=negative_model_inputs,
         )
-        with torch.no_grad(), self.disable_adapter():
-            reference_prediction = tuple(
-                prediction.detach()
-                for prediction in forward(
-                    module=self.module,
-                    model_config=self.model_config,
-                    model_inputs=model_inputs,
-                    negative_model_inputs=negative_model_inputs,
+        reference_prediction = None
+        if reference_enabled:
+            with torch.no_grad(), self.disable_adapter():
+                reference_prediction = tuple(
+                    prediction.detach()
+                    for prediction in forward(
+                        module=self.module,
+                        model_config=self.model_config,
+                        model_inputs=model_inputs,
+                        negative_model_inputs=negative_model_inputs,
+                    )
                 )
+        if not self.full_nft:
+            self._set_adapter("default")
+        if self.full_nft and self._full_policy_version < 6 and step in (0, 19):
+            self._full_event(
+                "nft_forward", selected_step=int(step), samples=len(micro_batch),
+                timesteps=micro_batch["train_timesteps"][:, step].detach().cpu().tolist(),
+                same_state_and_conditioning=True, distinct_policy_modules=old_module is not self.module,
+                old_requires_grad=any(value.requires_grad for value in old_prediction),
+                current_requires_grad=all(value.requires_grad for value in current_prediction),
+                base_reference_forward_executed=reference_prediction is not None,
+                current_old_video_mse=float((current_prediction[0].detach() - old_prediction[0]).square().mean().item()),
+                current_old_audio_mse=float((current_prediction[1].detach() - old_prediction[1]).square().mean().item()),
+                predictions_finite=all(bool(torch.isfinite(value).all())
+                                       for value in (*current_prediction, *old_prediction)),
+                gradient_accumulation_steps=tu.get_non_tensor_data(
+                    micro_batch, "gradient_accumulation_steps", default=None
+                ),
             )
-        self._set_adapter("default")
         model_output = self.prepare_model_outputs(
             (old_prediction, current_prediction, reference_prediction, x0, xt, flow_time), micro_batch
         )

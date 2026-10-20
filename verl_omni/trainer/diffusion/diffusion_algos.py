@@ -1079,6 +1079,15 @@ class DiffusionNFTLoss(DiffusionLossFn):
 class OmniNFTLoss(DiffusionNFTLoss):
     """Two-branch DiffusionNFT objective for joint audio-video generation."""
 
+    @staticmethod
+    def requires_reference(config: DiffusionActorConfig) -> bool:
+        """Whether actor-side reference predictions are required by the resolved coefficients."""
+        loss_cfg = config.diffusion_loss
+        return bool(getattr(config, "use_kl_loss", False)) or any(
+            float(getattr(loss_cfg, name, 0.0)) != 0.0
+            for name in ("ref_kl_coef", "video_ref_kl_coef", "audio_ref_kl_coef")
+        )
+
     @classmethod
     def validate_trainer_config(cls, config: Any) -> None:
         """Reject single-latent timestep staging before starting OmniNFT workers."""
@@ -1092,13 +1101,11 @@ class OmniNFTLoss(DiffusionNFTLoss):
     required_model_output_keys = (
         "video_forward_prediction",
         "video_old_prediction",
-        "video_ref_forward_prediction",
         "video_x0",
         "video_xt",
         "video_t_expanded",
         "audio_forward_prediction",
         "audio_old_prediction",
-        "audio_ref_forward_prediction",
         "audio_x0",
         "audio_xt",
         "audio_t_expanded",
@@ -1110,7 +1117,7 @@ class OmniNFTLoss(DiffusionNFTLoss):
         *,
         forward_prediction: torch.Tensor,
         old_prediction: torch.Tensor,
-        ref_forward_prediction: torch.Tensor,
+        ref_forward_prediction: torch.Tensor | None,
         x0: torch.Tensor,
         xt: torch.Tensor,
         t_expanded: torch.Tensor,
@@ -1125,7 +1132,8 @@ class OmniNFTLoss(DiffusionNFTLoss):
         loss_cfg = config.diffusion_loss
         beta = loss_cfg.mix_beta
         old_prediction = old_prediction.detach()
-        ref_forward_prediction = ref_forward_prediction.detach()
+        if ref_forward_prediction is None and OmniNFTLoss.requires_reference(config):
+            raise ValueError("OmniNFT reference predictions are required when any reference coefficient or KL is enabled.")
 
         reward_weight = reward_prob
         if reward_weight.ndim > 1:
@@ -1156,16 +1164,18 @@ class OmniNFTLoss(DiffusionNFTLoss):
         negative_loss = ((negative_x0 - x0).square() / negative_weight).mean(dim=reduce_dims)
         policy_per_sample = reward_weight * positive_loss / beta + (1.0 - reward_weight) * negative_loss / beta
         policy_loss = (policy_per_sample * loss_cfg.adv_clip_max).mean()
-        ref_loss = (forward_prediction - ref_forward_prediction).square().mean()
+        ref_loss = forward_prediction.new_zeros(())
         details = {
             "positive_loss": positive_loss.mean(),
             "negative_loss": negative_loss.mean(),
-            "ref_kl_loss": ref_loss,
             "old_deviate": (forward_prediction - old_prediction).square().mean(),
             "reward_prob_mean": reward_weight.mean(),
             "reward_prob_std": reward_weight.float().std(unbiased=False),
             "reward_prob_saturation_frac": ((reward_weight <= 1e-6) | (reward_weight >= 1.0 - 1e-6)).float().mean(),
         }
+        if ref_forward_prediction is not None:
+            ref_loss = (forward_prediction - ref_forward_prediction.detach()).square().mean()
+            details["ref_kl_loss"] = ref_loss
         return policy_loss, ref_loss, details
 
     @classmethod
@@ -1174,14 +1184,14 @@ class OmniNFTLoss(DiffusionNFTLoss):
         *,
         video_forward_prediction: torch.Tensor,
         video_old_prediction: torch.Tensor,
-        video_ref_forward_prediction: torch.Tensor,
+        video_ref_forward_prediction: torch.Tensor | None = None,
         video_x0: torch.Tensor,
         video_xt: torch.Tensor,
         video_t_expanded: torch.Tensor,
         video_reward_prob: torch.Tensor,
         audio_forward_prediction: torch.Tensor,
         audio_old_prediction: torch.Tensor,
-        audio_ref_forward_prediction: torch.Tensor,
+        audio_ref_forward_prediction: torch.Tensor | None = None,
         audio_x0: torch.Tensor,
         audio_xt: torch.Tensor,
         audio_t_expanded: torch.Tensor,
@@ -1246,6 +1256,8 @@ class OmniNFTLoss(DiffusionNFTLoss):
             )
         loss, metrics = self.compute_loss(
             **{key: model_output[key] for key in self.required_model_output_keys},
+            video_ref_forward_prediction=model_output.get("video_ref_forward_prediction"),
+            audio_ref_forward_prediction=model_output.get("audio_ref_forward_prediction"),
             video_reward_prob=reward_prob[:, 0],
             audio_reward_prob=reward_prob[:, 1],
             config=config,
@@ -1260,11 +1272,12 @@ class OmniNFTLoss(DiffusionNFTLoss):
         norm_by_std: bool,
         global_std: bool,
         epsilon: float = 1e-4,
+        correction: int = 0,
     ) -> torch.Tensor:
         """Center each reward component by prompt group and optionally normalize it.
 
-        Use population standard deviation, either per group or across the full
-        batch. Normalize components before routing them to video/audio.
+        Default to population standard deviation. A sample correction may be
+        selected explicitly for complete prompt groups before modality routing.
         """
         if scores.ndim != 2:
             raise ValueError(f"OmniNFT reward scores must have shape [B, K], got {tuple(scores.shape)}.")
@@ -1274,6 +1287,8 @@ class OmniNFTLoss(DiffusionNFTLoss):
             raise ValueError(f"OmniNFT uid count {len(uid)} does not match reward batch size {scores.shape[0]}.")
         if epsilon <= 0:
             raise ValueError(f"OmniNFT advantage epsilon must be positive, got {epsilon}.")
+        if correction not in (0, 1):
+            raise ValueError(f"OmniNFT standard deviation correction must be 0 or 1, got {correction}.")
 
         scores = scores.detach().float()
         groups: dict[Any, list[int]] = defaultdict(list)
@@ -1281,13 +1296,18 @@ class OmniNFTLoss(DiffusionNFTLoss):
             groups[group_id].append(index)
 
         advantages = torch.empty_like(scores)
-        batch_std = scores.std(dim=0, correction=0) if global_std and norm_by_std else None
+        if norm_by_std and correction and (
+            (global_std and len(scores) <= correction)
+            or (not global_std and any(len(indices) <= correction for indices in groups.values()))
+        ):
+            raise ValueError("OmniNFT sample standard deviation requires at least two scores per normalization group.")
+        batch_std = scores.std(dim=0, correction=correction) if global_std and norm_by_std else None
         for indices in groups.values():
             index_tensor = torch.tensor(indices, device=scores.device)
             group_scores = scores.index_select(0, index_tensor)
             centered = group_scores - group_scores.mean(dim=0, keepdim=True)
             if norm_by_std:
-                std = batch_std if batch_std is not None else group_scores.std(dim=0, correction=0)
+                std = batch_std if batch_std is not None else group_scores.std(dim=0, correction=correction)
                 centered = centered / (std.unsqueeze(0) + epsilon)
             advantages.index_copy_(0, index_tensor, centered)
         return advantages
@@ -1367,11 +1387,26 @@ class OmniNFTLoss(DiffusionNFTLoss):
             raise ValueError("OmniNFT actor batch requires reward_names in meta_info.")
         reward_names = list(reward_names)
 
+        prompt_group_std = bool(getattr(actor_cfg.diffusion_loss, "prompt_group_std", False))
+        if prompt_group_std:
+            if not algorithm_cfg.norm_adv_by_std_in_grpo or algorithm_cfg.global_std:
+                raise ValueError("OmniNFT prompt_group_std requires norm_adv_by_std_in_grpo=True and global_std=False.")
+            if int(config.actor_rollout_ref.rollout.n) != 8:
+                raise ValueError("OmniNFT prompt_group_std requires rollout.n=8 and complete UID K8 groups.")
+            groups: dict[Any, int] = defaultdict(int)
+            for group_id in batch.non_tensor_batch["uid"]:
+                groups[group_id] += 1
+            if not groups or any(count != 8 for count in groups.values()):
+                raise ValueError("OmniNFT prompt_group_std requires exactly eight scores for every prompt UID.")
+            if not torch.isfinite(scores).all():
+                raise ValueError("OmniNFT prompt_group_std requires finite raw reward components.")
+
         reward_advantages = cls._compute_component_advantages(
             scores=scores,
             uid=batch.non_tensor_batch["uid"],
             norm_by_std=algorithm_cfg.norm_adv_by_std_in_grpo,
             global_std=algorithm_cfg.global_std,
+            correction=1 if prompt_group_std else 0,
         )
         routing_matrix = cls._build_reward_routing_matrix(
             reward_names=reward_names,
@@ -2041,8 +2076,10 @@ class DiffusionARTLoss(DiffusionLossFn):
                 if bool(OmegaConf.select(config.actor_rollout_ref, path, default=False)) != expected:
                     problems.append(f"algorithm.{key} must equal actor_rollout_ref.{path}")
         group_std = bool(algorithm_cfg.get("art_prompt_group_std", False))
-        if group_std and (not joint or not algorithm_cfg.get("art_joint_reward_routing", False)):
-            problems.append("art_prompt_group_std requires art_joint_latent and art_joint_reward_routing")
+        if group_std and joint != bool(algorithm_cfg.get("art_joint_reward_routing", False)):
+            problems.append("art_prompt_group_std requires matching joint-latent and joint-reward routing modes")
+        if group_std and int(rollout_cfg.n) != 8:
+            problems.append("art_prompt_group_std requires rollout.n=8 and complete prompt groups")
         exempt = bool(algorithm_cfg.get("art_first_update_mask_exempt", False))
         if bool(actor_cfg.diffusion_loss.get("art_first_update_mask_exempt", False)) != exempt:
             problems.append("algorithm and actor.diffusion_loss must agree on art_first_update_mask_exempt")
@@ -2057,8 +2094,10 @@ class DiffusionARTLoss(DiffusionLossFn):
         if full:
             if int(model_cfg.get("lora_rank", 0) or 0) != 0 or model_cfg.get("lora_adapter_path", None) is not None:
                 problems.append("Full ART forbids LoRA adapters and adapter initialization")
-            if not joint or not cached:
-                problems.append("Full ART requires joint latent and cached conditional velocity, with no old teacher")
+            if not cached:
+                problems.append("Full ART requires cached conditional velocity, with no old teacher")
+            if float(algorithm_cfg.timestep_fraction) != 1.0:
+                problems.append("Full cached ART requires timestep_fraction=1.0")
             if actor_cfg.get("strategy") != "fsdp2":
                 problems.append("Full ART currently requires actor.strategy=fsdp2")
             if int(OmegaConf.select(actor_cfg, "fsdp_config.fsdp_size", default=0)) != 32:
@@ -2345,6 +2384,10 @@ class DiffusionARTLoss(DiffusionLossFn):
             return {modality: rewards for modality in modalities}, None
         names = sorted({name for weights in routing.values() for name in weights})
         uid = batch.non_tensor_batch["uid"]
+        if group_std:
+            _, counts = np.unique(uid, return_counts=True)
+            if int(config.actor_rollout_ref.rollout.n) != 8 or not np.all(counts == 8):
+                raise ValueError("art_prompt_group_std requires complete prompt-K8 groups before splitting.")
         components = torch.stack(
             [
                 DiffusionNFTLoss._compute_group_advantages(
@@ -2635,6 +2678,8 @@ class DiffusionARTLoss(DiffusionLossFn):
             seed=step_seed,
         )
         num_train = step_index.shape[1]
+        if bool(getattr(getattr(config.actor_rollout_ref, "model", None), "full_finetune", False)):
+            batch.batch["art_train_step_count"] = torch.full((batch_size,), num_train, dtype=torch.int64)
         next_timesteps = torch.cat([all_timesteps[:, 1:], torch.zeros_like(all_timesteps[:, :1])], dim=1)
         latent_index = step_index.view(batch_size, num_train, *([1] * (states.ndim - 2))).expand(
             -1, -1, *states.shape[2:]

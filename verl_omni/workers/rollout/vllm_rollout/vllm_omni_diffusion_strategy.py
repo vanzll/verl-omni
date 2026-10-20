@@ -496,7 +496,12 @@ class DiffusionStrategy(OmniStrategyBase):
         fields: dict[str, Any] = {"global_steps": self.server.global_steps}
         if os.environ.get("OMNI_FULL_FINETUNE") == "1":
             version = getattr(self.server, "_full_committed_policy_version", None)
-            if version is None or version != 2 * self.server.global_steps:
+            from verl_omni.utils.full_policy_sync import full_policy_sync_clock
+
+            expected = full_policy_sync_clock(
+                self.server.global_steps, nft=os.environ.get("OMNI_VARIANT", "").startswith("NFT_FULL32_")
+            )["policy_version"]
+            if version is None or version != expected:
                 raise RuntimeError("Full rollout cache cannot be produced before native weight commit.")
             fields["art_policy_version"] = torch.tensor(version, dtype=torch.int64)
         for name, source, value in (

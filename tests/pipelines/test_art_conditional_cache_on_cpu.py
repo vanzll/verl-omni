@@ -379,7 +379,7 @@ def test_temporal_loop_preserves_late_injected_metadata(engine_case, stage_input
         get_device_id=lambda: "cpu",
         prepare_micro_batches=micro_batches,
         LoRAAdapterMixin=type("LoRAAdapterMixin", (), {}),
-        FullPolicyMixin=type("FullPolicyMixin", (), {}),
+        FullNFTPolicyMixin=type("FullNFTPolicyMixin", (), {}),
         BaseEngine=type("BaseEngine", (), {}),
         ABC=type("ABC", (), {}),
     )

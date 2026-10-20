@@ -43,6 +43,7 @@ COMMON_ENVIRONMENT = {
     "NCCL_ALGO": "Ring",
     "NCCL_PROTO": "Simple",
     "NCCL_IB_DISABLE": "0",
+    "NCCL_IB_PCI_RELAXED_ORDERING": "0",
     "NCCL_P2P_DISABLE": "0",
     "NCCL_NVLS_ENABLE": "0",
     "NCCL_SHM_DISABLE": "0",

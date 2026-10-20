@@ -2,6 +2,15 @@
 set -euo pipefail
 
 source /m2v_intern2/zhenglin/my_bashrc.sh
+joint=true
+exclude_final=true
+identity=ART-A12
+if [[ "${OMNI_VARIANT:-}" == ART_FULL32_ROUTED ]]; then
+  [[ "${OMNI_FULL_FINETUNE:?}" == 1 ]] || exit 2
+  joint=false
+  exclude_final=false
+  identity=ART-ROUTED20
+fi
 campaign=${OMNI_CAMPAIGN_ROOT:?}
 control=${OMNI_CONTROL_DIR:?}
 [[ $# == 0 ]] || { echo "A3 protocol is fixed; use OMNI_UPDATE_MICROBATCH=1,2,4 at prepare" >&2; exit 2; }
@@ -25,7 +34,7 @@ run_name=${RUN_NAME:?RUN_NAME is required}
 source_sha=${SOURCE_SNAPSHOT_SHA256:?SOURCE_SNAPSHOT_SHA256 is required}
 ray_address=${RAY_ADDRESS:?}
 if [[ "${OMNI_FULL_FINETUNE:-0}" == 1 ]]; then
-  [[ "$run_name" == LTX23-ART-A12-FULL32-P32K8-U2-S42-* ]] || exit 2
+  [[ "$run_name" == LTX23-"${identity}"-FULL32-P32K8-U2-S42-* ]] || exit 2
   full_args=(++actor_rollout_ref.model.full_finetune=true actor_rollout_ref.model.lora_rank=0
     actor_rollout_ref.actor.strategy=fsdp2 actor_rollout_ref.actor.fsdp_config.strategy=fsdp2
     actor_rollout_ref.actor.fsdp_config.fsdp_size=32 actor_rollout_ref.actor.fsdp_config.reshard_after_forward=true
@@ -86,17 +95,18 @@ exec bash "$repo/examples/diffusionart_trainer/ltx2/run_ltx2_t2av_art_lora.sh" \
   actor_rollout_ref.rollout.val_kwargs.pipeline.height=512 \
   actor_rollout_ref.rollout.val_kwargs.pipeline.width=768 \
   algorithm.art_prompt_balanced_split=true \
-  algorithm.art_joint_reward_routing=true \
-  algorithm.art_joint_latent=true \
+  algorithm.art_exclude_final_step="$exclude_final" \
+  algorithm.art_joint_reward_routing="$joint" \
+  algorithm.art_joint_latent="$joint" \
   algorithm.art_cached_conditional_velocity=true \
   algorithm.norm_adv_by_std_in_grpo=false \
   ++algorithm.art_prompt_group_std=true \
   ++algorithm.art_first_update_mask_exempt=true \
   ++actor_rollout_ref.actor.diffusion_loss.art_first_update_mask_exempt=true \
-  ++actor_rollout_ref.actor.diffusion_loss.art_joint_latent=true \
+  ++actor_rollout_ref.actor.diffusion_loss.art_joint_latent="$joint" \
   ++actor_rollout_ref.actor.diffusion_loss.art_cached_conditional_velocity=true \
   ++actor_rollout_ref.rollout.algo.art_cached_conditional_velocity=true \
-  ++actor_rollout_ref.rollout.algo.art_joint_latent=true \
+  ++actor_rollout_ref.rollout.algo.art_joint_latent="$joint" \
   actor_rollout_ref.model.pipeline.guidance_scale=1.0 \
   ++actor_rollout_ref.model.pipeline.video_cfg_scale=1.0 \
   ++actor_rollout_ref.model.pipeline.audio_cfg_scale=1.0 \
@@ -111,6 +121,7 @@ exec bash "$repo/examples/diffusionart_trainer/ltx2/run_ltx2_t2av_art_lora.sh" \
   ++trainer.gpu_reservation_start_unix_mean="${OMNI_GPU_RESERVATION_START_UNIX_MEAN:-0}" \
   ++trainer.launch_files_manifest_sha256="${OMNI_LAUNCH_MANIFEST_SHA256:-preflight}" \
   ++ray_kwargs.ray_init.runtime_env.env_vars.PYTHONPATH="$PYTHONPATH" \
+  ++ray_kwargs.ray_init.runtime_env.env_vars.OMNI_VARIANT="\"${OMNI_VARIANT:-A12JOINT32}\"" \
   ++ray_kwargs.ray_init.address="$ray_address" \
   ++trainer.campaign.base_commit=93c8a747252d27e4549fba4e4b23abc19d6114bb \
   ++trainer.campaign.source_snapshot_sha256="$source_sha" \

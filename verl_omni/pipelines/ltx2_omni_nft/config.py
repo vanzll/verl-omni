@@ -30,6 +30,7 @@ class OmniNFTLossConfig(DiffusionLossConfig):
     audio_weight: float = 1.0
     video_ref_kl_coef: float = 0.0
     audio_ref_kl_coef: float = 0.0
+    prompt_group_std: bool = False
 
     def __post_init__(self):
         super().__post_init__()

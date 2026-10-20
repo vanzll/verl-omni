@@ -90,10 +90,11 @@ class vLLMOmniColocateWorkerExtension(CustomPipelineWorkerExtension):
     _pending_lora_peft_config: dict | None = None
 
     def set_full_policy_sync_metadata(self, metadata):
+        from verl_omni.utils.full_policy_sync import validate_full_policy_sync_clock
+
         if os.environ.get("OMNI_FULL_FINETUNE") != "1":
             raise ValueError("Full weight metadata is only allowed in the opt-in Full allocation.")
-        if metadata["policy_version"] != 2 * metadata["global_steps"]:
-            raise ValueError("Full policy version does not match the two-update rollout boundary.")
+        validate_full_policy_sync_clock(metadata, nft=os.environ.get("OMNI_VARIANT", "").startswith("NFT_FULL32_"))
         previous = getattr(self, "_full_committed_state", None)
         if getattr(self, "_full_pending_metadata", None) is not None:
             raise RuntimeError("Full weight transaction already has unconsumed metadata.")
@@ -118,6 +119,9 @@ class vLLMOmniColocateWorkerExtension(CustomPipelineWorkerExtension):
                     **{key: committed[key] for key in (
                         "policy_version", "global_steps", "post_load_checks", "buckets"
                     )},
+                    **{key: committed[key] for key in (
+                        "policy_algorithm", "optimizer_updates_per_rollout"
+                    ) if key in committed},
                     "source_tensor_count": len(committed["source_tensors"]),
                     "loaded_target_count": len(committed["loaded_targets"]),
                     "checked_kinds": committed["checked_kinds"],
